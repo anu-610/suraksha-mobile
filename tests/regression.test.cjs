@@ -431,3 +431,11 @@ test('relaying never shares the relay phone location automatically', () => {
   const relayed=new BLEMeshService().prepareRelay(payload(),'relay',payload().location);
   assert.equal(relayed.relayChain[0].location,undefined);
 });
+
+test('a durable signed cancellation wins after a crash before alert cleanup', async () => {
+  const h=queueHarness();const event=await h.service.triggerSOS(params);
+  h.store.set('@suraksha.cancel.packets.v2',JSON.stringify([{...event,protocolVersion:2,revision:1,messageType:'SOS_CANCEL'}]));
+  assert.equal((await h.service.activeSOS()).length,0);
+  h.setOnline(true);await h.service.retryPendingQueue();
+  assert.equal(h.sent.length,0);assert.equal(h.store.get('@suraksha_sos_queue'),'[]');
+});

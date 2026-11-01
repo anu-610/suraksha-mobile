@@ -36,8 +36,9 @@ async function list<T>(key: string): Promise<T[]> {
   return value ? JSON.parse(value) : [];
 }
 export async function nearbyEvents(): Promise<ActiveSOSEvent[]> {
+  const cancelled = await list<{ id: string; owner: string; until: number }>(TOMBSTONES);
   const hidden = await list<{ id: string; until: number }>(DISMISSED);
-  return (await list<ActiveSOSEvent>(NEARBY)).filter(event => isLivePayload(event) && !hidden.some(item => item.id === event.sosId && item.until > Date.now()));
+  return (await list<ActiveSOSEvent>(NEARBY)).filter(event => isLivePayload(event) && !cancelled.some(p => p.id === event.sosId && p.owner === event.userId && p.until > Date.now()) && !hidden.some(item => item.id === event.sosId && item.until > Date.now()));
 }
 export async function dismissNearbySOS(id: string): Promise<void> {
   await serial(async () => {
@@ -160,7 +161,13 @@ export async function processMeshWork(): Promise<void> {
   await forwarding;
 }
 async function forwardPending(): Promise<void> {
-  const pending = await serial(async () => (await list<SOSPayload>(RELAYS)).filter(isLivePayload));
+  const pending = await serial(async () => {
+    const cancelled = await list<{ id: string; owner: string; until: number }>(TOMBSTONES);
+    const live = (await list<SOSPayload>(RELAYS)).filter(p => isLivePayload(p) &&
+      (p.messageType === SOSMessageType.SOS_CANCEL || !cancelled.some(c => c.id === p.sosId && c.owner === p.userId && c.until > Date.now())));
+    await AsyncStorage.setItem(RELAYS, JSON.stringify(live));
+    return live;
+  });
   const { isOnline } = await NetworkService.checkConnectivity().catch(() => ({ isOnline: false }));
   for (const payload of pending) {
     let delivered = false;

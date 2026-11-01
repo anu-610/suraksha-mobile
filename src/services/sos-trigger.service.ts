@@ -122,7 +122,8 @@ export class SOSTriggerService {
     } catch { return false; }
   }
   public static async activeSOS(): Promise<SOSPayload[]> {
-    return (await this.read<SOSPayload>(ACTIVE_KEY)).filter(isLivePayload);
+    const cancelled = await this.read<SOSPayload>(CANCEL_PACKETS);
+    return (await this.read<SOSPayload>(ACTIVE_KEY)).filter(p => isLivePayload(p) && !cancelled.some(c => c.sosId === p.sosId));
   }
   public static async requestHelper(sosId: string): Promise<void> {
     await this.exclusive(async () => {
@@ -147,7 +148,7 @@ export class SOSTriggerService {
       await this.exclusive(async () => {
         const active = await this.read<SOSPayload>(ACTIVE_KEY);
         const current = active.find(p => p.sosId === old.sosId);
-        if (!current || !isLivePayload(current)) return; // Cancel may have completed during GPS acquisition.
+        if (!current || !isLivePayload(current) || (await this.read<SOSPayload>(CANCEL_PACKETS)).some(p => p.sosId === current.sosId)) return; // Cancel may have completed during GPS acquisition.
         const next: SOSPayload = { ...current, protocolVersion: 2, revision: (current.revision ?? 0) + 1,
           timestamp: new Date().toISOString(), location, hopCount: 0, relayChain: [] };
         next.originProof = await signOrigin(next, false);
@@ -173,6 +174,20 @@ export class SOSTriggerService {
   }
   private static async flushQueue(): Promise<void> {
     const { isOnline } = await NetworkService.checkConnectivity().catch(() => ({ isOnline: false }));
+    // A crash after persisting the signed cancel but before pruning the alert must never revive it.
+    await this.exclusive(async () => {
+      const packets = await this.read<SOSPayload>(CANCEL_PACKETS);
+      const active = await this.read<SOSPayload>(ACTIVE_KEY);
+      const queue = await this.read<SOSPayload>(QUEUE_KEY);
+      const pending = await this.read<SOSCancellation>(CANCEL_KEY);
+      for (const packet of packets) {
+        if ([...active, ...queue].some(p => p.sosId === packet.sosId) && !pending.some(p => p.sosId === packet.sosId))
+          pending.push({ sosId: packet.sosId, userId: packet.userId, cancelledAt: packet.timestamp, reason: packet.message });
+      }
+      await AsyncStorage.setItem(CANCEL_KEY, JSON.stringify(pending));
+      await AsyncStorage.setItem(ACTIVE_KEY, JSON.stringify(active.filter(p => !packets.some(c => c.sosId === p.sosId))));
+      for (const packet of packets) await this.remove(packet.sosId);
+    });
     const cancellations = await this.exclusive(() => this.read<SOSCancellation>(CANCEL_KEY));
     for (const cancellation of cancellations) {
       await this.exclusive(() => this.remove(cancellation.sosId));

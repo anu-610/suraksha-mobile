@@ -19,7 +19,8 @@ import { SOSApiService } from '../services/sos-api.service';
 import { BackendSettings } from '../components/BackendSettings';
 import { AuthPanel } from '../components/AuthPanel';
 import { Session, loadSession, signOut } from '../services/session.service';
-import { setRelayEnabled, isRelayEnabled } from '../services/mesh-runtime.service';
+import { startSOSTracking, stopSOSTracking } from '../services/sos-tracking.service';
+import { setRelayEnabled, isRelayEnabled, helperOffers, shareHelperLocation } from '../services/mesh-runtime.service';
 import { useBLEMesh } from '../hooks/useBLEMesh';
 import { DeliveryMethod, SOSType, SOSPayload } from '../interfaces/sos.types';
 
@@ -40,6 +41,13 @@ function RelayPanel({ deviceId, userId }: { deviceId: string; userId: string }) 
         try { await SOSApiService.respond(event.sosId, userId); Alert.alert('Response recorded', 'The server has recorded that you are on your way.'); }
         catch (error) { Alert.alert('Response not confirmed', error instanceof Error ? error.message : 'Reconnect and try again.'); }
       }}><Text style={{ color: '#7af', padding: 8 }}>I can help — mark me en route</Text></TouchableOpacity>
+      {event.helperRequested && <TouchableOpacity onPress={() => Alert.alert('Share your location?',
+        'This person asks to approach an online helper. Share a GPS snapshot for 5 minutes and allow them to approach? Nearby mesh devices can read this snapshot. Your location is not shared unless you agree.', [
+          { text: 'Decline', style: 'cancel' }, { text: 'Agree and share', onPress: () => { void shareHelperLocation(event)
+            .then(() => Alert.alert('Location shared', 'Your snapshot is being relayed for 5 minutes. Stay there only if safe.'))
+            .catch(error => Alert.alert('Unable to share', error.message)); } }])}>
+        <Text style={{ color: '#7af', padding: 8 }}>Request: may this person approach you?</Text>
+      </TouchableOpacity>}
       <TouchableOpacity accessibilityRole="button" onPress={() => { void dismissSOS(event.sosId).catch(() => Alert.alert('Unable to dismiss alert', 'Please try again.')); }}><Text style={{ color: '#ddd', padding: 8 }}>Dismiss this message</Text></TouchableOpacity>
     </View>)}
   </View>;
@@ -62,6 +70,18 @@ export default function Index() {
     void isRelayEnabled().then(enabled => { if (enabled) void SOSTriggerService.getDeviceId().then(setRelayDevice); });
   }, []);
   const [lastSOS, setLastSOS] = useState<SOSPayload | null>(null);
+  const [offers, setOffers] = useState<SOSPayload[]>([]);
+  useEffect(() => {
+    const refresh = async () => {
+      if (!userId) { setLastSOS(null); setOffers([]); return; }
+      const active = (await SOSTriggerService.activeSOS()).find(p => p.userId === userId) ?? null;
+      setLastSOS(active);
+      setOffers(active ? await helperOffers(active.sosId) : []);
+    };
+    void refresh();
+    const timer = setInterval(() => { void refresh().catch(() => undefined); }, 5000);
+    return () => clearInterval(timer);
+  }, [userId]);
   const sending = useRef(false);
   const [pulseAnim] = useState(() => new Animated.Value(1));
   const [progressAnim] = useState(() => new Animated.Value(0));
@@ -114,6 +134,12 @@ export default function Index() {
       const payload = await SOSTriggerService.triggerSOS({ userId, userName, userPhone,
         sosType: type });
       setLastSOS(payload);
+      Alert.alert('Keep SOS location updated', 'Suraksha attempts a location update every minute while SOS is active. Allow background location to continue with the screen locked. Android may open Settings: choose Allow all the time.', [
+        { text: 'While app is open', style: 'cancel' },
+        { text: 'Enable background updates', onPress: () => { void startSOSTracking().then(enabled => {
+          if (!enabled) Alert.alert('Background updates unavailable', 'Keep the app open for location updates.');
+        }).catch(error => Alert.alert('Tracking unavailable', error.message)); } },
+      ]);
       if (payload.deliveryMethod === DeliveryMethod.DIRECT_ONLINE) {
         setStatus('sent');
         setStatusMsg(`SOS received by server. ID: ${payload.sosId.slice(0, 8)}`);
@@ -140,6 +166,7 @@ export default function Index() {
       setStatus(confirmed ? 'idle' : 'queued');
       setStatusMsg(confirmed ? 'SOS cancellation confirmed by server.' : 'Cancellation saved. Server confirmation is pending.');
       setLastSOS(null);
+      await stopSOSTracking().catch(() => undefined);
     } catch (error) {
       setStatus('error');
       setStatusMsg(error instanceof Error ? error.message : 'Unable to save cancellation.');
@@ -160,7 +187,7 @@ export default function Index() {
       <BackendSettings onSaved={() => setSettingsVersion(value => value + 1)} />
       {!session ? <AuthPanel key={settingsVersion} onSession={setSession} /> : <View style={{ padding: 16 }}>
         <Text style={styles.statusText}>Signed in as {session.user.name}</Text>
-        <TouchableOpacity onPress={async () => { await setRelayEnabled(false); await signOut(); SOSApiService.setAuthToken(undefined); setRelayDevice(null); setSession(null); }}><Text style={styles.statusText}>Sign out</Text></TouchableOpacity>
+        <TouchableOpacity onPress={async () => { if (lastSOS) { Alert.alert('SOS is active', 'Cancel your SOS before signing out.'); return; } await setRelayEnabled(false); await stopSOSTracking(); await signOut(); SOSApiService.setAuthToken(undefined); setRelayDevice(null); setSession(null); }}><Text style={styles.statusText}>Sign out</Text></TouchableOpacity>
       </View>}
       <TouchableOpacity style={styles.cancelBtn} onPress={async () => {
         try {
@@ -197,6 +224,19 @@ export default function Index() {
         </View>
       )}
 
+      {lastSOS && <View style={{ padding: 16, gap: 8 }}>
+        <Text style={styles.statusText}>Location updates are attempted about every minute while this SOS remains active. Last attempt: {new Date(lastSOS.timestamp).toLocaleTimeString()}.</Text>
+        <Text style={styles.statusText}>Without internet, moving out of Bluetooth range can interrupt delivery. Stay nearby if safe; move to safety whenever necessary. Bluetooth broadcasting does not confirm delivery.</Text>
+        <TouchableOpacity onPress={async () => {
+          try { await setRelayEnabled(true); setRelayDevice(await SOSTriggerService.getDeviceId()); await SOSTriggerService.requestHelper(lastSOS.sosId); Alert.alert('Request broadcasting', 'An online helper must agree before their location is shown.'); }
+          catch (error) { Alert.alert('Unable to request help', error instanceof Error ? error.message : 'Try again'); }
+        }}><Text style={{ color: '#7af', padding: 8 }}>Ask an online helper for permission to approach</Text></TouchableOpacity>
+        {offers.map(offer => <View key={offer.sosId}>
+          <Text style={styles.statusText}>{offer.userName} agreed that you may approach if safe. Location shared at {new Date(offer.timestamp).toLocaleTimeString()}; expires after 5 minutes. They had backend connectivity when sharing; it may change.</Text>
+          <Text style={styles.statusText}>{offer.location?.latitude.toFixed(5)}, {offer.location?.longitude.toFixed(5)} · accuracy ±{Math.round(offer.location?.accuracy ?? 0)} m</Text>
+          <TouchableOpacity onPress={() => { if (offer.location) void Linking.openURL(`https://www.google.com/maps/search/?api=1&query=${offer.location.latitude},${offer.location.longitude}`).catch(() => Alert.alert('Unable to open maps')); }}><Text style={{ color: '#7af', padding: 8 }}>View agreed meeting location</Text></TouchableOpacity>
+        </View>)}
+      </View>}
       {lastSOS && <TouchableOpacity style={styles.cancelBtn} onPress={cancelSOS}><Text style={styles.statusText}>Cancel this SOS</Text></TouchableOpacity>}
       {/* ── Type Picker Modal ── */}
       <Modal visible={showPicker} transparent animationType="slide" onRequestClose={() => setShowPicker(false)}>

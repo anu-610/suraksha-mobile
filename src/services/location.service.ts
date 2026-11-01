@@ -2,8 +2,8 @@ import * as Location from 'expo-location';
 import { SOSLocation } from '../interfaces/sos.types';
 
 export class LocationService {
-  public static async getCurrentLocation(): Promise<SOSLocation> {
-    const permission = await Location.requestForegroundPermissionsAsync();
+  public static async getCurrentLocation(requestPermission = true): Promise<SOSLocation> {
+    const permission = await (requestPermission ? Location.requestForegroundPermissionsAsync() : Location.getForegroundPermissionsAsync());
     if (!permission.granted) throw new Error('Location permission is required to send accurate SOS coordinates.');
     let timer: ReturnType<typeof setTimeout> | undefined;
     let position: Location.LocationObject;

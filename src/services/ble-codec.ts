@@ -6,7 +6,10 @@ export function isLivePayload(payload: SOSPayload): boolean {
   const age = Date.now() - Date.parse(payload.timestamp);
   return typeof payload.sosId === 'string' && payload.sosId.length > 0 &&
     typeof payload.userId === 'string' && typeof payload.userName === 'string' &&
-    Object.values(SOSType).includes(payload.sosType) && payload.messageType === SOSMessageType.SOS_ALERT &&
+    Object.values(SOSType).includes(payload.sosType) && [SOSMessageType.SOS_ALERT, SOSMessageType.SOS_CANCEL, SOSMessageType.SOS_HELPER].includes(payload.messageType) &&
+    (payload.protocolVersion === undefined ? payload.messageType === SOSMessageType.SOS_ALERT :
+      payload.protocolVersion === 2 && Number.isSafeInteger(payload.revision) && payload.revision! >= 0) &&
+    (payload.messageType !== SOSMessageType.SOS_HELPER || (typeof payload.targetSosId === 'string' && typeof payload.targetDeviceId === 'string' && payload.ttlSeconds <= 300 && !!payload.location)) &&
     Number.isFinite(age) && age >= -300000 && age < payload.ttlSeconds * 1000 &&
     Number.isInteger(payload.ttlSeconds) && payload.ttlSeconds > 0 && payload.ttlSeconds <= 3600 &&
     Number.isInteger(payload.hopCount) && payload.hopCount >= 0 &&

@@ -7,6 +7,7 @@ const wireLocation = (location: SOSLocation) => ({ ...location, lat: location.la
 export const toWirePayload = (payload: SOSPayload) => ({
   origin_proof: payload.originProof ? { certificate: payload.originProof.certificate,
     signed_payload: payload.originProof.signedPayload, signature: payload.originProof.signature } : undefined,
+  protocol_version: payload.protocolVersion, revision: payload.revision ?? 0, helper_requested: payload.helperRequested ?? false,
   sos_id: payload.sosId, user_id: payload.userId, user_name: payload.userName,
   user_phone: payload.userPhone, sos_type: payload.sosType, message_type: payload.messageType,
   location: payload.location ? wireLocation(payload.location) : null, delivery_method: payload.deliveryMethod,
@@ -60,7 +61,7 @@ export class SOSApiService {
   }
 
   public static async sendSOS(payload: SOSPayload): Promise<SOSResponse> {
-    return this.result(await this.request<WireResponse>('/sos', {
+    return this.result(await this.request<WireResponse>(payload.messageType === 'SOS_CANCEL' ? '/sos/mesh-cancel' : '/sos', {
       method: 'POST', body: JSON.stringify(toWirePayload(payload)),
     }, payload.authToken));
   }

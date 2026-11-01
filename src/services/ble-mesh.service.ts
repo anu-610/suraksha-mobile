@@ -100,7 +100,7 @@ export class BLEMeshService {
   }
   public prepareRelay(payload: SOSPayload, deviceId: string, location?: SOSLocation): SOSPayload {
     return { ...payload, authToken: undefined, deliveryMethod: DeliveryMethod.BLE_RELAY,
-      hopCount: payload.hopCount + 1, relayChain: [...payload.relayChain, { deviceId, timestamp: new Date().toISOString(), location }] };
+      hopCount: payload.hopCount + 1, relayChain: [...payload.relayChain, { deviceId, timestamp: new Date().toISOString() }] };
   }
   public async broadcastCancellation(cancellation: SOSCancellation): Promise<void> {
     // Unauthenticated BLE cancellations could suppress somebody else's emergency.

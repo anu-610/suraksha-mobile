@@ -51,7 +51,9 @@ export async function enrollDevice(deviceId: string, userId: string): Promise<vo
   }
 }
 export function immutableOrigin(payload: SOSPayload) {
-  return { sos_id: payload.sosId, user_id: payload.userId, user_name: payload.userName,
+  return { ...(payload.protocolVersion === 2 ? { protocol_version: 2, message_type: payload.messageType,
+      revision: payload.revision, helper_requested: payload.helperRequested ?? false,
+      target_sos_id: payload.targetSosId ?? '', target_device_id: payload.targetDeviceId ?? '' } : {}), sos_id: payload.sosId, user_id: payload.userId, user_name: payload.userName,
     user_phone: payload.userPhone || '', sos_type: payload.sosType,
     lat: payload.location?.latitude ?? null, lng: payload.location?.longitude ?? null, timestamp: payload.timestamp,
     origin_device_id: payload.originDeviceId, ttl_seconds: payload.ttlSeconds, max_hops: payload.maxHops, message: payload.message || '' };
@@ -83,6 +85,9 @@ export async function verifyOrigin(payload: SOSPayload): Promise<void> {
       !Number.isFinite(claims.exp) || claims.exp * 1000 <= Date.now() || claims.sub !== payload.userId || claims.device_id !== payload.originDeviceId ||
       !p256.verify(decode(parts[2]), Buffer.from(`${parts[0]}.${parts[1]}`), bytes(authority), { prehash: true, lowS: false })) throw new Error('Untrusted or expired device certificate');
   const signed = JSON.parse(proof.signedPayload);
+  if (signed.protocol_version !== payload.protocolVersion ||
+      (payload.protocolVersion === undefined && (payload.messageType !== 'SOS_ALERT' || (payload.revision ?? 0) !== 0)))
+    throw new Error('SOS protocol mismatch');
   const expected = immutableOrigin(payload);
   if (Object.entries(expected).some(([key,value]) => signed[key] !== value) ||
       !p256.verify(bytes(proof.signature), Buffer.from(proof.signedPayload), bytes(claims.public_key), { prehash: true, lowS: false })) throw new Error('SOS origin signature mismatch');

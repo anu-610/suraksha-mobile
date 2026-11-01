@@ -43,7 +43,8 @@ export enum DeliveryMethod {
 export enum SOSMessageType {
   SOS_ALERT = 'SOS_ALERT',
   SOS_CANCEL = 'SOS_CANCEL',
-  SOS_ACK = 'SOS_ACK'
+  SOS_ACK = 'SOS_ACK',
+  SOS_HELPER = 'SOS_HELPER'
 }
 
 /**
@@ -90,6 +91,12 @@ export interface OriginProof {
 }
 
 export interface SOSPayload {
+  /** Version 2 signs control type and revision; absent means legacy alert. */
+  protocolVersion?: 2;
+  revision?: number;
+  helperRequested?: boolean;
+  targetSosId?: string;
+  targetDeviceId?: string;
   originProof?: OriginProof;
   /** UUIDv4 generated client-side to ensure idempotency and prevent duplicates */
   sosId: string;

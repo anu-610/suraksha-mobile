@@ -4,16 +4,21 @@ import * as Notifications from 'expo-notifications';
 import * as Location from 'expo-location';
 import * as BackgroundTask from 'expo-background-task';
 import * as Peripheral from '../../modules/ble-peripheral';
+import * as Crypto from 'expo-crypto';
+import { LocationService } from './location.service';
 import { Platform } from 'react-native';
 import { decodePayload, isLivePayload } from './ble-codec';
-import { verifyOrigin } from './origin-security';
+import { signOrigin, verifyOrigin } from './origin-security';
 import { bleMeshInstance, SOSTriggerService } from './sos-trigger.service';
 import { SOSApiService, ApiError } from './sos-api.service';
 import { loadSession } from './session.service';
 import { NetworkService } from './network.service';
-import { ActiveSOSEvent, SOSPayload, SOSLocation } from '../interfaces/sos.types';
+import { ActiveSOSEvent, SOSPayload, SOSLocation, SOSMessageType, SOSStatus, DeliveryMethod } from '../interfaces/sos.types';
 
 export const RETRY_TASK = 'suraksha-sos-retry-v2';
+const TOMBSTONES = '@suraksha.mesh.cancelled.v2';
+const OFFERS = '@suraksha.helper.offers.v2';
+const packetKey = (p: SOSPayload) => `${p.sosId}:${p.messageType}:${p.revision ?? 0}`;
 const RELAYS = '@suraksha.relay.pending.v2';
 const NEARBY = '@suraksha.nearby.v2';
 const FORWARDED = '@suraksha.relay.forwarded.v1';
@@ -64,8 +69,10 @@ async function receiveMeshInbox(): Promise<void> {
     const deviceId = await SOSTriggerService.getDeviceId();
     const selfLocation = await location();
     let events = (await list<ActiveSOSEvent>(NEARBY)).filter(isLivePayload);
-    const pending = (await list<SOSPayload>(RELAYS)).filter(isLivePayload);
+    let pending = (await list<SOSPayload>(RELAYS)).filter(isLivePayload);
+    const cancelled = (await list<{ id: string; owner: string; until: number }>(TOMBSTONES)).filter(p => p.until > Date.now());
     const forwarded = (await list<{ id: string; until: number }>(FORWARDED)).filter(item => item.until > Date.now());
+    let offers = (await list<SOSPayload>(OFFERS)).filter(isLivePayload);
     for (const packet of await Peripheral.getInbox()) {
       let payload: SOSPayload;
       try { payload = decodePayload(packet); await verifyOrigin(payload); }
@@ -73,29 +80,82 @@ async function receiveMeshInbox(): Promise<void> {
       if (payload.originDeviceId === deviceId || payload.relayChain.some(node => node.deviceId === deviceId)) {
         await Peripheral.acknowledgeInbox(packet); continue;
       }
-      const firstReceipt = !events.some(event => event.sosId === payload.sosId);
-      if (firstReceipt) {
+      const cancellation = payload.messageType === SOSMessageType.SOS_CANCEL;
+      const helper = payload.messageType === SOSMessageType.SOS_HELPER;
+      const tombstone = cancelled.some(p => p.id === payload.sosId && p.owner === payload.userId);
+      if (!cancellation && tombstone) { await Peripheral.acknowledgeInbox(packet); continue; }
+      const previous = events.find(p => p.sosId === payload.sosId);
+      if (previous && previous.userId !== payload.userId) { await Peripheral.acknowledgeInbox(packet); continue; }
+      if (cancellation) {
+        if (!tombstone) cancelled.push({ id: payload.sosId, owner: payload.userId,
+          until: Date.parse(payload.timestamp) + 3900000 });
+        events = events.filter(p => p.sosId !== payload.sosId);
+        pending = pending.filter(p => p.sosId !== payload.sosId || p.messageType === SOSMessageType.SOS_CANCEL);
+        offers = offers.filter(p => p.targetSosId !== payload.sosId);
+        await AsyncStorage.setItem(TOMBSTONES, JSON.stringify(cancelled));
+        if (!tombstone) await bleMeshInstance.stopAdvertising(payload.sosId).catch(() => undefined);
+        await Notifications.dismissNotificationAsync(`sos-${payload.sosId}`).catch(() => undefined);
+      } else if (helper) {
+        if (payload.targetDeviceId === deviceId) {
+          const own = await SOSTriggerService.activeSOS();
+          if (own.some(p => p.sosId === payload.targetSosId && p.helperRequested))
+            offers = [...offers.filter(p => p.sosId !== payload.sosId), payload].slice(-100);
+        }
+      } else if (!previous || (payload.revision ?? 0) > (previous.revision ?? 0)) {
         const distanceMeters = selfLocation && payload.location ? bleMeshInstance.calculateDistance(selfLocation.latitude, selfLocation.longitude,
           payload.location.latitude, payload.location.longitude) : undefined;
         const event = { ...payload, distanceMeters };
-        events = [...events.slice(-199), event];
-        await AsyncStorage.setItem(NEARBY, JSON.stringify(events));
+        events = [...events.filter(p => p.sosId !== payload.sosId).slice(-199), event];
         bleMeshInstance.reportReceived(event);
-        await notify(event).catch(() => undefined); // Denied notifications must not block emergency forwarding.
+        if (!previous) await notify(event).catch(() => undefined);
+      } else if ((payload.revision ?? 0) < (previous.revision ?? 0)) {
+        await Peripheral.acknowledgeInbox(packet); continue;
       }
-      if (!forwarded.some(item => item.id === payload.sosId) && payload.hopCount < payload.maxHops && !pending.some(item => item.sosId === payload.sosId)) {
-        pending.push(bleMeshInstance.prepareRelay(payload, deviceId, selfLocation));
-        await AsyncStorage.setItem(RELAYS, JSON.stringify(pending));
+      if (!forwarded.some(item => item.id === packetKey(payload)) && payload.hopCount < payload.maxHops &&
+          !pending.some(item => packetKey(item) === packetKey(payload))) {
+        pending = pending.filter(p => p.sosId !== payload.sosId);
+        pending.push(bleMeshInstance.prepareRelay(payload, deviceId));
       }
-      // Acknowledge only after the forwarding queue is durable.
+      await AsyncStorage.setItem(NEARBY, JSON.stringify(events));
+      await AsyncStorage.setItem(OFFERS, JSON.stringify(offers));
+      await AsyncStorage.setItem(RELAYS, JSON.stringify(pending));
+      if (cancellation && payload.hopCount < payload.maxHops)
+        await bleMeshInstance.startAdvertising(bleMeshInstance.prepareRelay(payload, deviceId)).catch(() => undefined);
       await Peripheral.acknowledgeInbox(packet);
     }
   });
+}
+export async function helperOffers(sosId: string): Promise<SOSPayload[]> {
+  return (await list<SOSPayload>(OFFERS)).filter(p => p.targetSosId === sosId && isLivePayload(p));
+}
+/** Called only after a helper explicitly agrees in the UI. No automatic location sharing. */
+export async function shareHelperLocation(event: SOSPayload): Promise<void> {
+  const session = await loadSession();
+  if (!session || !event.helperRequested || !isLivePayload(event)) throw new Error('This help request is no longer available.');
+  if (!(await NetworkService.checkConnectivity()).isOnline) throw new Error('Connect to the backend before offering an online meeting point.');
+  // Confirm this SOS reached the backend before describing this phone as an online helper.
+  await SOSApiService.sendSOS(bleMeshInstance.prepareRelay(event, await SOSTriggerService.getDeviceId()));
+  const fix = await LocationService.getCurrentLocation();
+  if (fix.provider === 'last_known') throw new Error('Wait for a fresh GPS fix before sharing a meeting point.');
+  const timestamp = new Date().toISOString();
+  const offer: SOSPayload = { ...event, protocolVersion: 2, revision: 0, sosId: Crypto.randomUUID(),
+    messageType: SOSMessageType.SOS_HELPER, userId: session.user.user_id, userName: session.user.name,
+    userPhone: '', originDeviceId: await SOSTriggerService.getDeviceId(), timestamp, createdAt: timestamp,
+    targetSosId: event.sosId, targetDeviceId: event.originDeviceId, helperRequested: false,
+    location: fix, ttlSeconds: 300, hopCount: 0, relayChain: [], status: SOSStatus.ACTIVE,
+    deliveryMethod: DeliveryMethod.BLE_RELAY, message: 'You may approach me if it is safe.' };
+  offer.originProof = await signOrigin(offer, false);
+  await serial(async () => {
+    const queue = (await list<SOSPayload>(RELAYS)).filter(isLivePayload);
+    await AsyncStorage.setItem(RELAYS, JSON.stringify([...queue, offer]));
+  });
+  await bleMeshInstance.startAdvertising(offer);
 }
 // Incoming packets and notifications never wait for an API upload. Only short
 // storage updates share the inbox lock; the single upload pump reconciles IDs.
 export async function processMeshWork(): Promise<void> {
   await receiveMeshInbox();
+  await SOSTriggerService.updateActiveLocations();
   if (!forwarding) forwarding = forwardPending().finally(() => { forwarding = undefined; });
   await forwarding;
 }
@@ -105,21 +165,24 @@ async function forwardPending(): Promise<void> {
   for (const payload of pending) {
     let delivered = false;
     let cancelled = false;
-    if (isOnline) {
+    if (isOnline && payload.messageType !== SOSMessageType.SOS_HELPER) {
       try { await SOSApiService.sendSOS(payload); delivered = true; }
       catch (error) { if (error instanceof ApiError && error.status === 410) { delivered = true; cancelled = true; } }
     }
     if (delivered) {
-      await bleMeshInstance.stopAdvertising(payload.sosId).catch(() => undefined);
       await serial(async () => {
-        const forwarded = (await list<{ id: string; until: number }>(FORWARDED)).filter(item => item.until > Date.now() && item.id !== payload.sosId);
-        forwarded.push({ id: payload.sosId, until: Date.parse(payload.timestamp) + payload.ttlSeconds * 1000 });
+        const forwarded = (await list<{ id: string; until: number }>(FORWARDED)).filter(item => item.until > Date.now() && item.id !== packetKey(payload));
+        forwarded.push({ id: packetKey(payload), until: Date.parse(payload.timestamp) + payload.ttlSeconds * 1000 });
         await AsyncStorage.setItem(FORWARDED, JSON.stringify(forwarded));
-        const latest = (await list<SOSPayload>(RELAYS)).filter(item => item.sosId !== payload.sosId && isLivePayload(item));
+        const latest = (await list<SOSPayload>(RELAYS)).filter(item => packetKey(item) !== packetKey(payload) && isLivePayload(item));
         await AsyncStorage.setItem(RELAYS, JSON.stringify(latest));
         if (cancelled) await AsyncStorage.setItem(NEARBY, JSON.stringify((await list<ActiveSOSEvent>(NEARBY)).filter(item => item.sosId !== payload.sosId)));
       });
-    } else await bleMeshInstance.startAdvertising(payload).catch(() => undefined);
+    } else await serial(async () => {
+      // Cancellation or a newer revision may have replaced this snapshot during upload.
+      if ((await list<SOSPayload>(RELAYS)).some(p => packetKey(p) === packetKey(payload)))
+        await bleMeshInstance.startAdvertising(payload).catch(() => undefined);
+    });
   }
   await SOSTriggerService.retryPendingQueue();
 }
@@ -144,7 +207,7 @@ export async function startMeshRuntime(): Promise<void> {
   const work = () => { void processMeshWork().catch(error => console.warn('SOS work deferred', error instanceof Error ? error.message : 'unknown')); };
   bleMeshInstance.on('onInboxReady', work);
   const stopNetwork = NetworkService.subscribe(online => { if (online) work(); });
-  timer = setInterval(work, 30000);
+  timer = setInterval(work, 10000);
   unsubscribe = () => { stopNetwork(); bleMeshInstance.off('onInboxReady', work); if (timer) clearInterval(timer); unsubscribe = undefined; };
   if (Platform.OS !== 'web') {
     if (await isRelayEnabled()) await bleMeshInstance.startScanning().catch(() => undefined);

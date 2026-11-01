@@ -91,3 +91,44 @@ an SOS after 15 minutes. Enable nearby relay again after signing in.
 Users register with role user. Dashboard responders are promoted by the backend
 operator using scripts/manage_account.py; the dashboard also accepts their
 email/password. Test tokens remain in Advanced and still have their old expiry.
+
+## Active SOS updates and helper consent (protocol 2)
+
+Install the matching mobile build on **all** test phones and upgrade the backend
+with `python -m alembic upgrade head` (migration 007) before testing. Old phones
+continue to accept initial alerts but cannot interpret cancellation/helper controls.
+
+1. Send an online SOS, move to a different safe location, and wait 60–90 seconds.
+   Confirm the same SOS ID moves on the response desk without losing responder status.
+2. Repeat with phone A offline and phone B online. Keep Bluetooth and relay enabled.
+   Check several revisions, then restore A's network; old packets must not move the pin back.
+3. Cancel on offline A. B should remove the nearby alert and upload the signed cancel.
+   Repeat with the cancellation arriving before the first alert, and restart B.
+   A delayed original alert must not reappear.
+4. On A tap **Ask an online helper for permission to approach**. On B decline or
+   ignore the request: no helper coordinates should appear on A. Then explicitly
+   agree on B. A should show B's GPS snapshot and consent for five minutes only.
+   C must not display the offer as an SOS or as an offer addressed to C.
+5. Lock A after enabling background updates and granting Always / Allow all the
+   time location access. Check updates for several minutes. Cancel and verify the
+   location foreground notification stops. Deny background access and confirm
+   that SOS still sends and updates while the app is open.
+6. Restart A with an active SOS and confirm its cancel button returns. Disconnect
+   the backend during an update and verify durable retry after reconnection.
+
+Updates are attempted about once per minute, subject to GPS latency and OS
+scheduling. Force-stop, denied background permission, battery restrictions, or a
+long period with the process killed can stop tracking. An SOS that receives no
+refresh for one hour expires locally. GPS failure sends a locationless update;
+the backend retains its last valid coordinates. No automated test proves radio
+range, delivery between physical phones, or safety of a route.
+
+Helper offers are explicit five-minute **snapshots**, not continuous tracking.
+Sharing means the helper permits an approach if safe. Bluetooth mesh peers can
+read the snapshot; the consent dialog explains this before sharing. Network
+connectivity is checked at offer time and can subsequently change. Regular relay
+packets no longer attach the relay phone's coordinates automatically.
+
+The previous repeated HTTP 422 incident is not reproduced or diagnosed by these
+changes. Capture the failed endpoint and response detail if it recurs; do not
+share access tokens or device private keys.

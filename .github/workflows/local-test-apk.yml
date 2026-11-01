@@ -1,7 +1,7 @@
 name: Local test APK
 on:
   push:
-    branches: [master]
+    branches: [master, codex/sos-live-updates-20261101]
     paths: ['.github/workflows/local-test-apk.yml', 'app.config.js', 'modules/ble-peripheral/android/src/main/java/com/suraksha/bleperipheral/BlePeripheralModule.kt', 'src/services/origin-security.ts', 'tests/regression.test.cjs']
   workflow_dispatch:
     inputs:

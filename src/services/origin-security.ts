@@ -13,6 +13,8 @@ const CA = 'suraksha.device.ca.v2';
 const options = { keychainAccessible: SecureStore.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY };
 let memory: string | null = null;
 let authority: string | null = null;
+let nextRenewalCheck = 0;
+let renewal: Promise<void> | undefined;
 const hex = (bytes: Uint8Array) => Buffer.from(bytes).toString('hex');
 const bytes = (value: string) => Uint8Array.from(Buffer.from(value, 'hex'));
 // React Native bundles buffer@6, whose encodings omit Node's 'base64url'.
@@ -50,10 +52,29 @@ export async function enrollDevice(deviceId: string, userId: string): Promise<vo
     await SecureStore.setItemAsync(CA, authority!, options);
   }
 }
+/** Renew during ordinary app/background work, never on the urgent SOS path. */
+export async function renewDeviceIfNeeded(): Promise<void> {
+  if (renewal) return renewal;
+  if (Date.now() < nextRenewalCheck) return;
+  nextRenewalCheck = Date.now() + 3600000;
+  renewal = (async () => {
+    const identity = await stored();
+    if (!identity) return;
+    const claims = JSON.parse(Buffer.from(decode(identity.certificate.split('.')[1])).toString('utf8'));
+    if (claims.exp * 1000 < Date.now() + 7 * 86400000) await enrollDevice(identity.deviceId, identity.userId);
+  })().catch(error => { nextRenewalCheck = Date.now() + 60000; throw error; }).finally(() => { renewal = undefined; });
+  return renewal;
+}
 export function immutableOrigin(payload: SOSPayload) {
-  return { ...(payload.protocolVersion === 2 ? { protocol_version: 2, message_type: payload.messageType,
+  return { ...(payload.protocolVersion ? { protocol_version: payload.protocolVersion, message_type: payload.messageType,
       revision: payload.revision, helper_requested: payload.helperRequested ?? false,
-      target_sos_id: payload.targetSosId ?? '', target_device_id: payload.targetDeviceId ?? '' } : {}), sos_id: payload.sosId, user_id: payload.userId, user_name: payload.userName,
+      target_sos_id: payload.targetSosId ?? '', target_device_id: payload.targetDeviceId ?? '' } : {}),
+    ...(payload.protocolVersion === 3 ? {
+      helper_request_id: payload.helperRequestId ?? '', helper_request_expires_at: payload.helperRequestExpiresAt ?? '', helper_state: payload.helperState ?? '',
+      location_captured_at: payload.location?.capturedAt ?? '', location_accuracy: payload.location?.accuracy ?? null,
+      location_provider: payload.location?.provider ?? '', receipt_kind: payload.receiptKind ?? '', receipt_revision: payload.receiptRevision ?? 0,
+      receipt_message_type: payload.receiptMessageType ?? '', receipt_status: payload.receiptStatus ?? '', receipt_user_id: payload.receiptUserId ?? '',
+    } : {}), sos_id: payload.sosId, user_id: payload.userId, user_name: payload.userName,
     user_phone: payload.userPhone || '', sos_type: payload.sosType,
     lat: payload.location?.latitude ?? null, lng: payload.location?.longitude ?? null, timestamp: payload.timestamp,
     origin_device_id: payload.originDeviceId, ttl_seconds: payload.ttlSeconds, max_hops: payload.maxHops, message: payload.message || '' };
@@ -73,6 +94,11 @@ export async function signOrigin(payload: SOSPayload, allowRenewal = true): Prom
   return proof;
 }
 export async function verifyOrigin(payload: SOSPayload): Promise<void> {
+  if (payload.messageType === 'SOS_ACK' && payload.receiptKind === 'server') {
+    const trusted = await readServerReceipt(payload.serverReceipt ?? '');
+    if (JSON.stringify(immutableOrigin(payload)) !== JSON.stringify(immutableOrigin(trusted))) throw new Error('Server receipt mismatch');
+    return;
+  }
   const proof = payload.originProof;
   if (!proof) throw new Error('Unsigned BLE alert');
   authority = process.env.EXPO_PUBLIC_DEVICE_CA_PUBLIC_KEY || authority || (Platform.OS === 'web' ? null : await SecureStore.getItemAsync(CA, options));
@@ -91,4 +117,18 @@ export async function verifyOrigin(payload: SOSPayload): Promise<void> {
   const expected = immutableOrigin(payload);
   if (Object.entries(expected).some(([key,value]) => signed[key] !== value) ||
       !p256.verify(bytes(proof.signature), Buffer.from(proof.signedPayload), bytes(claims.public_key), { prehash: true, lowS: false })) throw new Error('SOS origin signature mismatch');
+}
+
+export async function readServerReceipt(token: string): Promise<SOSPayload> {
+  authority = process.env.EXPO_PUBLIC_DEVICE_CA_PUBLIC_KEY || authority || (Platform.OS === 'web' ? null : await SecureStore.getItemAsync(CA, options));
+  if (!authority || token.length > 8192) throw new Error('No trusted server receipt authority');
+  const parts = token.split('.');
+  if (parts.length !== 3) throw new Error('Invalid server receipt');
+  const header = JSON.parse(Buffer.from(decode(parts[0])).toString('utf8'));
+  const claims = JSON.parse(Buffer.from(decode(parts[1])).toString('utf8'));
+  if (header.alg !== 'ES256' || claims.iss !== 'suraksha-device-ca' || claims.aud !== 'suraksha-receipt' ||
+      !Number.isFinite(claims.exp) || claims.exp * 1000 <= Date.now() || !claims.packet ||
+      claims.packet.messageType !== 'SOS_ACK' || claims.packet.receiptKind !== 'server' ||
+      !p256.verify(decode(parts[2]), Buffer.from(`${parts[0]}.${parts[1]}`), bytes(authority), { prehash: true, lowS: false })) throw new Error('Untrusted server receipt');
+  return { ...claims.packet, serverReceipt: token };
 }

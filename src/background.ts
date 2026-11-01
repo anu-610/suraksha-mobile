@@ -16,7 +16,7 @@ if (Platform.OS !== 'web') {
     const fix = data.locations[data.locations.length - 1];
     if (Date.now() - fix.timestamp > 120000) return;
     await SOSTriggerService.updateActiveLocations({ latitude: fix.coords.latitude, longitude: fix.coords.longitude,
-      accuracy: fix.coords.accuracy ?? 1000, provider: 'gps' });
+      accuracy: fix.coords.accuracy ?? 1000, provider: 'gps', capturedAt: new Date(fix.timestamp).toISOString() });
     await processMeshWork();
   });
   TaskManager.defineTask(RETRY_TASK, async () => {

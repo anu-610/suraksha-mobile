@@ -1,7 +1,8 @@
 import { PermissionsAndroid, Platform } from 'react-native';
 import * as Peripheral from '../../modules/ble-peripheral';
-import { SOSPayload, SOSCancellation, SOSLocation, DeliveryMethod } from '../interfaces/sos.types';
+import { SOSPayload, SOSLocation, DeliveryMethod } from '../interfaces/sos.types';
 import { encodePayload, isLivePayload } from './ble-codec';
+import { canReplace } from './mesh-policy';
 
 
 type Events = { onInboxReady: undefined; onSOSReceived: SOSPayload; onError: Error; onRelayComplete: SOSPayload };
@@ -16,7 +17,8 @@ export class BLEMeshService {
   private subscriptions: { remove(): void }[] = [];
   private relayTimers = new Set<ReturnType<typeof setTimeout>>();
   private advertisingId: string | null = null;
-  private advertisingExpiry: ReturnType<typeof setTimeout> | undefined;
+  private latest = new Map<string, SOSPayload>();
+  private retired = new Map<string, number>();
 
   public on<K extends keyof Events>(name: K, callback: (value: Events[K]) => void) { this.listeners[name].add(callback); }
   public off<K extends keyof Events>(name: K, callback: (value: Events[K]) => void) { this.listeners[name].delete(callback); }
@@ -40,21 +42,31 @@ export class BLEMeshService {
   }
 
   public async startAdvertising(payload: SOSPayload): Promise<void> {
+    if (payload.uploadOnly) return;
+    const suppressed = () => (this.retired.get(payload.sosId) ?? 0) > Date.now() && payload.messageType !== 'SOS_CANCEL' ||
+      payload.messageType === 'SOS_HELPER' && (this.retired.get(payload.targetSosId ?? '') ?? 0) > Date.now();
+    if (suppressed()) return;
     const encoded = encodePayload(payload);
+    for (const [id, p] of this.latest) if (Date.parse(p.timestamp) + p.ttlSeconds * 1000 + 300000 < Date.now()) this.latest.delete(id);
+    if (!canReplace(this.latest.get(payload.sosId), payload)) return;
+    this.latest.set(payload.sosId, payload);
     await this.initialize();
+    if (this.latest.get(payload.sosId) !== payload || suppressed()) return;
     if (!(await Peripheral.startAdvertising(encoded))) throw new Error('Bluetooth advertising did not start');
     this.advertisingId = payload.sosId;
-    if (this.advertisingExpiry) clearTimeout(this.advertisingExpiry);
-    const remaining = Math.max(0, Date.parse(payload.timestamp) + payload.ttlSeconds * 1000 - Date.now());
-    this.advertisingExpiry = setTimeout(() => {
-      void this.stopAdvertising(payload.sosId).catch(error => this.emit('onError', error));
-    }, remaining);
+    // Native transport expires each packet separately. A stale JS timer must
+    // never remove a newer cancellation/update with the same SOS ID.
   }
   public async stopAdvertising(sosId?: string): Promise<void> {
     if (sosId) { await Peripheral.removeAdvertisement(sosId); return; }
-    if (this.advertisingExpiry) clearTimeout(this.advertisingExpiry);
     if (this.initialized) await Peripheral.stopAdvertising();
     this.advertisingId = null;
+  }
+  public async retireSOS(sosId: string, replacingWithCancellation = false): Promise<void> {
+    for (const [id, until] of this.retired) if (until <= Date.now()) this.retired.delete(id);
+    this.retired.set(sosId, Date.now() + 3900000);
+    if (!replacingWithCancellation) await Peripheral.removeAdvertisement(sosId);
+    for (const p of this.latest.values()) if (p.messageType === 'SOS_HELPER' && p.targetSosId === sosId) await Peripheral.removeAdvertisement(p.sosId);
   }
   public reportReceived(payload: SOSPayload) { this.emit('onSOSReceived', payload); }
   public async requestPermissions(advertiseOnly = false): Promise<void> {
@@ -100,12 +112,9 @@ export class BLEMeshService {
   }
   public prepareRelay(payload: SOSPayload, deviceId: string, location?: SOSLocation): SOSPayload {
     return { ...payload, authToken: undefined, deliveryMethod: DeliveryMethod.BLE_RELAY,
-      hopCount: payload.hopCount + 1, relayChain: [...payload.relayChain, { deviceId, timestamp: new Date().toISOString() }] };
-  }
-  public async broadcastCancellation(cancellation: SOSCancellation): Promise<void> {
-    // Unauthenticated BLE cancellations could suppress somebody else's emergency.
-    // Stop the local advert; authoritative cancellation is retried through the API.
-    await this.stopAdvertising(cancellation.sosId);
+      uploadOnly: payload.hopCount >= payload.maxHops,
+      hopCount: Math.min(payload.maxHops, payload.hopCount + 1),
+      relayChain: payload.relayChain.length < 15 ? [...payload.relayChain, { deviceId, timestamp: new Date().toISOString() }] : payload.relayChain };
   }
   public calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
     const rad = Math.PI / 180;

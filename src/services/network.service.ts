@@ -7,12 +7,16 @@ import { apiUrl, loadApiSettings } from '../constants/api';
 import NetInfo, { NetInfoState, NetInfoSubscription } from '@react-native-community/netinfo';
 
 export class NetworkService {
+  private static checking: Promise<{ isOnline: boolean; connectionType: string }> | undefined;
   /**
    * Checks the network connectivity.
    * Verifies both the interface connection and actual internet reachability 
    * to avoid false positives with captive portals or local-only connections.
    */
   public static async checkConnectivity(): Promise<{ isOnline: boolean; connectionType: string }> {
+    return this.checking ??= this.probe().finally(() => { this.checking = undefined; });
+  }
+  private static async probe(): Promise<{ isOnline: boolean; connectionType: string }> {
     await loadApiSettings();
     const state: NetInfoState = await NetInfo.fetch();
     

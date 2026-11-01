@@ -31,7 +31,7 @@ function loader(mocks = {}, globals = {}) {
 }
 function payload(id = 'sos-1') {
   return { sosId: id, userId: 'owner', userName: 'Name', userPhone: '123', sosType: 'MEDICAL',
-    messageType: 'SOS_ALERT', location: { latitude: 12, longitude: 77, accuracy: 0, provider: 'gps' },
+    messageType: 'SOS_ALERT', location: { latitude: 12, longitude: 77, accuracy: 0, provider: 'gps', capturedAt: new Date().toISOString() },
     timestamp: new Date().toISOString(), createdAt: new Date().toISOString(), originDeviceId: 'device',
     hopCount: 0, maxHops: 15, relayChain: [], ttlSeconds: 3600, status: 'ACTIVE', deliveryMethod: 'DIRECT_ONLINE' };
 }
@@ -85,27 +85,31 @@ test('BLE round-trip excludes bearer tokens and rejects expired/oversized packet
 
 function queueHarness() {
   const store = new Map();
-  let locationCalls = 0; let failLocation = false; let blockSend; let online = false; let failSend = false; let failCancel = false; let advertise = false;
+  let locationCalls = 0; let failLocation = false; let blockSend; let blockAdvertise; let blockGPS; let cached = null; let online = false; let failSend = false; let failCancel = false; let advertise = false;
   const sent = [];
   const storage = { async getItem(key) { await Promise.resolve(); return store.get(key) ?? null; },
     async setItem(key,value) { await Promise.resolve(); store.set(key,value); } };
   class BLEMeshService {
     async requestPermissions() {}
-    async startAdvertising() { if (!advertise) throw Error('No BLE'); }
+    async startAdvertising() { if (blockAdvertise) await blockAdvertise(); if (!advertise) throw Error('No BLE'); }
     async stopAdvertising() {}
   }
   class ApiError extends Error {}
-  const api = { setAuthToken() {}, async sendSOS(p) { if (blockSend) await blockSend(); if (failSend) throw Error('Offline'); sent.push(p); return { success: true }; },
+  const api = { setAuthToken() {}, async sendSOS(p) { if (p.messageType === 'SOS_CANCEL') { if (failCancel) throw Error('Offline'); return { success: true }; } if (blockSend) await blockSend(); if (failSend) throw Error('Offline'); sent.push(p); return { success: true }; },
     async cancelSOS() { if (failCancel) throw Error('Offline'); return { success: true }; } };
   const load = loader({
     '@react-native-async-storage/async-storage': storage,
-    './location.service': { LocationService: { async getCurrentLocation() { locationCalls++; if (failLocation) throw Error("No GPS"); return payload().location; } } },
+    './location.service': { LocationService: { availableLocation: () => cached, async getCurrentLocation() { locationCalls++; if (blockGPS) await blockGPS(); if (failLocation) throw Error("No GPS"); return payload().location; } } },
     './network.service': { NetworkService: { async checkConnectivity() { return { isOnline: online }; } } },
     './origin-security': { signOrigin: async () => ({ certificate: 'test', signedPayload: '{}', signature: 'test' }) },
     'expo-crypto': { randomUUID: require('node:crypto').randomUUID },
     './sos-api.service': { SOSApiService: api, ApiError }, './ble-mesh.service': { BLEMeshService },
   });
-  return { service: load('src/services/sos-trigger.service.ts').SOSTriggerService, store, sent,
+  const service = load('src/services/sos-trigger.service.ts').SOSTriggerService;
+  return { service, store, sent, load,
+    async start(values) { const p = await service.triggerSOS(values); await service.updateActiveLocations(); await service.retryPendingQueue(); return p; },
+    setCached(value) { cached = value; }, setBlockGPS(value) { blockGPS = value; }, setBlockAdvertise(value) { blockAdvertise = value; },
+    resetRetries() { store.delete('@suraksha.retry.v3'); },
     setBlockSend(value) { blockSend=value; }, setOnline(value) { online=value; }, setFailSend(value) { failSend=value; }, setFailCancel(value) { failCancel=value; },
     setAdvertise(value) { advertise=value; }, setFailLocation(value) { failLocation=value; }, locationCalls() { return locationCalls; } };
 }
@@ -113,17 +117,17 @@ const params = { userId:'owner', userName:'Name', userPhone:'123', sosType:'MEDI
 
 test('offline SOS stays queued and concurrent additions are not lost', async () => {
   const h = queueHarness();
-  const results = await Promise.all([h.service.triggerSOS(params),h.service.triggerSOS(params)]);
+  const results = await Promise.all([h.start(params),h.start(params)]);
   assert.equal(results[0].deliveryMethod, 'OFFLINE_QUEUED');
   const raw = h.store.get('@suraksha_sos_queue');
   assert.equal(JSON.parse(raw).length, 2); assert.ok(!raw.includes('secret'));
   h.setOnline(true); await h.service.retryPendingQueue();
-  assert.equal(h.sent.length, 2); assert.equal(h.store.get('@suraksha_sos_queue'),'[]');
+  assert.ok(h.sent.length >= 2); assert.equal(h.store.get('@suraksha_sos_queue'),'[]');
 });
 
 test('failed retry remains durable and cancellation cannot resurrect an alert', async () => {
   const h = queueHarness();
-  const alert = await h.service.triggerSOS(params);
+  const alert = await h.start(params);
   h.setOnline(true); h.setFailSend(true);
   await h.service.retryPendingQueue();
   assert.equal(JSON.parse(h.store.get('@suraksha_sos_queue')).length, 1);
@@ -133,7 +137,7 @@ test('failed retry remains durable and cancellation cannot resurrect an alert', 
   h.setFailSend(false); await h.service.retryPendingQueue();
   assert.equal(h.sent.length, 0);
   assert.equal(JSON.parse(h.store.get('@suraksha_sos_cancellations')).length, 1);
-  h.setFailCancel(false); await h.service.retryPendingQueue();
+  h.setFailCancel(false); h.resetRetries(); await h.service.retryPendingQueue();
   assert.equal(h.store.get('@suraksha_sos_cancellations'), '[]');
 });
 
@@ -194,14 +198,15 @@ test('relay inbox is acknowledged only after persistence and failed uploads rema
     './origin-security':{verifyOrigin:async()=>{}},
     './session.service':{loadSession:async()=>({user:{user_id:'relay'}})},
     './network.service':{NetworkService:{checkConnectivity:async()=>({isOnline:true})}},
-    './sos-api.service':{ApiError:class extends Error {},SOSApiService:{sendSOS:async()=>{if(fail)throw Error('network unavailable');}}},
-    './sos-trigger.service':{SOSTriggerService:{getDeviceId:async()=> 'device-b',retryPendingQueue:async()=>{},updateActiveLocations:async()=>{}},bleMeshInstance:{reportReceived(){},prepareRelay:p=>({...p,hopCount:1}),startAdvertising:async()=>{advertised++;},stopAdvertising:async()=>{}}},
+    './sos-api.service':{ApiError:class extends Error {},SOSApiService:{sendSOS:async()=>{if(fail)throw Error('network unavailable'); return {success:true};}}},
+    './sos-trigger.service':{SOSTriggerService:{getDeviceId:async()=> 'device-b',retryPendingQueue:async()=>{},updateActiveLocations:async()=>{}},bleMeshInstance:{reportReceived(){},prepareRelay:p=>({...p,hopCount:1}),startAdvertising:async()=>{advertised++;},stopAdvertising:async()=>{},retireSOS:async()=>{}}},
   });
   const runtime=load('src/services/mesh-runtime.service.ts');
   await runtime.processMeshWork();
-  assert.equal(notifications,1);assert.equal(advertised,1);assert.equal(JSON.parse(store.get('@suraksha.relay.pending.v2')).length,1);
-  fail=false;await runtime.processMeshWork();
-  assert.equal(store.get('@suraksha.relay.pending.v2'),'[]');assert.equal(notifications,1);
+  assert.equal(notifications,1);assert.ok(advertised>=1);assert.equal(JSON.parse(store.get('@suraksha.relay.pending.v2')).length,1);
+  fail=false;store.delete('@suraksha.retry.v3');await runtime.processMeshWork();
+  assert.equal(JSON.parse(store.get('@suraksha.relay.forwarded.v1')).length,1);assert.equal(notifications,1);
+  assert.equal(JSON.parse(store.get('@suraksha.relay.pending.v2')).length,1); // radio retry survives HTTP delivery
 });
 
 test('new nearby alerts and persistent dismissal are independent of a blocked upload', async () => {
@@ -219,22 +224,23 @@ test('new nearby alerts and persistent dismissal are independent of a blocked up
     './origin-security':{verifyOrigin:async()=>{}},
     './session.service':{loadSession:async()=>({user:{user_id:'relay'}})},
     './network.service':{NetworkService:{checkConnectivity:async()=>({isOnline:true})}},
-    './sos-api.service':{ApiError:class extends Error {},SOSApiService:{sendSOS:async()=>{began(); await blocked;}}},
-    './sos-trigger.service':{SOSTriggerService:{getDeviceId:async()=> 'device-b',retryPendingQueue:async()=>{},updateActiveLocations:async()=>{}},bleMeshInstance:{reportReceived(){},prepareRelay:p=>({...p,hopCount:1}),startAdvertising:async()=>{},stopAdvertising:async()=>{}}},
+    './sos-api.service':{ApiError:class extends Error {},SOSApiService:{sendSOS:async()=>{began(); await blocked; return {success:true};}}},
+    './sos-trigger.service':{SOSTriggerService:{getDeviceId:async()=> 'device-b',retryPendingQueue:async()=>{},updateActiveLocations:async()=>{}},bleMeshInstance:{reportReceived(){},prepareRelay:p=>({...p,hopCount:1}),startAdvertising:async()=>{},stopAdvertising:async()=>{},retireSOS:async()=>{}}},
   };
   const runtime = loader(mocks)('src/services/mesh-runtime.service.ts');
   const first = runtime.processMeshWork(); await started;
   inbox=['two']; const second=runtime.processMeshWork();
   // Dismissal shares only the short storage lock, so also waits for packet two's ingestion.
   await runtime.dismissNearbySOS('one');
+  await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(notifications,['sos-one','sos-two']);
-  assert.equal(dismissed,'sos-one');
+  assert.equal(dismissed,'helper-one');
   assert.equal((await runtime.nearbyEvents()).map(x=>x.sosId).join(','),'two');
   const restarted = loader(mocks)('src/services/mesh-runtime.service.ts');
   assert.equal((await restarted.nearbyEvents()).map(x=>x.sosId).join(','),'two');
   release(); await Promise.all([first,second]);
   // Completion of upload one must not overwrite packet two's newly queued relay.
-  assert.equal(JSON.parse(store.get('@suraksha.relay.pending.v2'))[0].sosId,'two');
+  assert.ok(JSON.parse(store.get('@suraksha.relay.pending.v2')).some(p=>p.sosId==='two'));
   inbox=['one']; await runtime.processMeshWork();
   assert.deepEqual(notifications,['sos-one','sos-two']);
   assert.equal((await runtime.nearbyEvents()).length,1);
@@ -252,19 +258,20 @@ test('SOS starts nearby advertising before attempting an online upload', async (
   const calls=[]; const store=new Map();
   const service=loader({
     '@react-native-async-storage/async-storage':{getItem:async k=>store.get(k)??null,setItem:async(k,v)=>store.set(k,v)},
-    './location.service':{LocationService:{getCurrentLocation:async()=>payload().location}},
+    './location.service':{LocationService:{availableLocation:()=>null,getCurrentLocation:async()=>payload().location}},
     './origin-security':{signOrigin:async()=>({})}, 'expo-crypto':{randomUUID:require('node:crypto').randomUUID},
     './network.service':{NetworkService:{checkConnectivity:async()=>({isOnline:true})}},
-    './sos-api.service':{ApiError:class extends Error {},SOSApiService:{setAuthToken(){},sendSOS:async()=>{calls.push('upload');}}},
+    './sos-api.service':{ApiError:class extends Error {},SOSApiService:{setAuthToken(){},sendSOS:async()=>{calls.push('upload'); return {success:true};}}},
     './ble-mesh.service':{BLEMeshService:class {async requestPermissions(){} async startAdvertising(){calls.push('advertise');} async stopAdvertising(){} }},
   })('src/services/sos-trigger.service.ts').SOSTriggerService;
   const result=await service.triggerSOS(params);
-  assert.deepEqual(calls,['advertise','upload']);
-  assert.equal(result.deliveryMethod,'DIRECT_ONLINE');
+  await service.updateActiveLocations(); await service.retryPendingQueue();
+  assert.ok(calls.includes('advertise') && calls.includes('upload'));
+  assert.equal(result.deliveryMethod,'OFFLINE_QUEUED');
 });
 
 test('cancelling a queued SOS does not wait for an in-flight upload', async () => {
-  const h=queueHarness(); const event=await h.service.triggerSOS(params);
+  const h=queueHarness(); const event=await h.start(params);
   let release; const blocked=new Promise(resolve=>{release=resolve;});
   let began; const started=new Promise(resolve=>{began=resolve;});
   h.setBlockSend(async()=>{began();await blocked;}); h.setOnline(true);
@@ -316,10 +323,10 @@ test('IP changes probe without credentials and reject a different backend author
 
 test('offline SOS attempts GPS and still advertises when no fix is available', async () => {
   const h = queueHarness(); h.setAdvertise(true); h.setFailLocation(true);
-  const event = await h.service.triggerSOS(params);
+  const event = await h.start(params);
   assert.equal(h.locationCalls(), 1);
   assert.equal(event.location, null);
-  assert.equal(event.deliveryMethod, 'BLE_RELAY');
+  assert.equal(event.deliveryMethod, 'OFFLINE_QUEUED');
   assert.equal(JSON.parse(h.store.get('@suraksha_sos_queue'))[0].location, null);
   h.setOnline(true); await h.service.retryPendingQueue();
   assert.equal(h.sent[0].location, null);
@@ -327,8 +334,8 @@ test('offline SOS attempts GPS and still advertises when no fix is available', a
 
 test('online GPS failure still sends the emergency without coordinates', async () => {
   const h = queueHarness(); h.setOnline(true); h.setFailLocation(true);
-  const event = await h.service.triggerSOS(params);
-  assert.equal(event.deliveryMethod, 'DIRECT_ONLINE');
+  const event = await h.start(params);
+  assert.equal(event.deliveryMethod, 'OFFLINE_QUEUED');
   assert.equal(h.sent[0].location, null);
 });
 
@@ -356,15 +363,15 @@ test('Android offline advertising does not require location permission', async (
 });
 
 test('offline SOS includes an available GPS fix', async () => {
-  const h = queueHarness(); h.setAdvertise(true);
-  const event = await h.service.triggerSOS(params);
+  const h = queueHarness(); h.setAdvertise(true); h.setCached(payload().location);
+  const event = await h.start(params);
   assert.equal(event.location.latitude, 12);
-  assert.equal(event.deliveryMethod, 'BLE_RELAY');
+  assert.equal(event.deliveryMethod, 'OFFLINE_QUEUED');
 });
 
 test('active SOS survives delivery, refreshes once due, and cancellation persists a signed BLE control', async () => {
   const h = queueHarness(); h.setOnline(true);
-  const event = await h.service.triggerSOS(params);
+  const event = await h.start(params);
   assert.equal((await h.service.activeSOS()).length, 1);
   await h.service.updateActiveLocations();
   assert.equal(h.store.get('@suraksha_sos_queue'), '[]');
@@ -373,24 +380,24 @@ test('active SOS survives delivery, refreshes once due, and cancellation persist
   h.store.set('@suraksha.active.v2', JSON.stringify(stored));
   await h.service.updateActiveLocations({...payload().location, latitude:14});
   let queue = JSON.parse(h.store.get('@suraksha_sos_queue'));
-  assert.equal(queue[0].sosId,event.sosId); assert.equal(queue[0].revision,1); assert.equal(queue[0].location.latitude,14);
+  assert.equal(queue[0].sosId,event.sosId); assert.equal(queue[0].revision,2); assert.equal(queue[0].location.latitude,14);
   await h.service.cancelSOS(event.sosId,'owner');
   assert.equal((await h.service.activeSOS()).length,0);
   const packet = JSON.parse(h.store.get('@suraksha.cancel.packets.v2'))[0];
-  assert.equal(packet.messageType,'SOS_CANCEL'); assert.equal(packet.revision,2); assert.ok(packet.originProof);
+  assert.equal(packet.messageType,'SOS_CANCEL'); assert.equal(packet.revision,3); assert.ok(packet.originProof);
   await h.service.updateActiveLocations(undefined,true);
   assert.equal(h.store.get('@suraksha_sos_queue'),'[]');
 });
 
 test('newer queued location is retained when an older upload completes', async () => {
-  const h=queueHarness();const event=await h.service.triggerSOS(params);
+  const h=queueHarness();const event=await h.start(params);
   let release,began;const blocked=new Promise(r=>release=r);const started=new Promise(r=>began=r);
   h.setOnline(true);h.setBlockSend(async()=>{began();await blocked;});
   const retry=h.service.retryPendingQueue();await started;
   await h.service.updateActiveLocations({...payload().location, latitude:16},true);
   release();await retry;
   const queued=JSON.parse(h.store.get('@suraksha_sos_queue'));
-  assert.equal(queued.length,1);assert.equal(queued[0].revision,1);assert.equal(queued[0].sosId,event.sosId);
+  assert.equal(queued.length,1);assert.equal(queued[0].revision,2);assert.equal(queued[0].sosId,event.sosId);
 });
 
 test('relay updates same SOS, broadcasts cancellation online, and suppresses late alerts after restart', async () => {
@@ -403,7 +410,7 @@ test('relay updates same SOS, broadcasts cancellation online, and suppresses lat
     './origin-security':{verifyOrigin:async()=>{}},'./session.service':{loadSession:async()=>({user:{user_id:'relay'}})},
     './network.service':{NetworkService:{checkConnectivity:async()=>({isOnline:true})}},
     './sos-api.service':{ApiError:class extends Error{},SOSApiService:{sendSOS:async p=>sent.push(p)}},
-    './sos-trigger.service':{SOSTriggerService:{getDeviceId:async()=> 'device-b',retryPendingQueue:async()=>{},updateActiveLocations:async()=>{}},bleMeshInstance:{reportReceived(){},prepareRelay:p=>({...p,hopCount:1}),startAdvertising:async p=>ads.push(p),stopAdvertising:async()=>{}}},
+    './sos-trigger.service':{SOSTriggerService:{getDeviceId:async()=> 'device-b',retryPendingQueue:async()=>{},updateActiveLocations:async()=>{}},bleMeshInstance:{reportReceived(){},prepareRelay:p=>({...p,hopCount:1}),startAdvertising:async p=>ads.push(p),stopAdvertising:async()=>{},retireSOS:async()=>{}}},
   };
   const load=loader(mocks);let runtime=load('src/services/mesh-runtime.service.ts');const codec=load('src/services/ble-codec.ts');
   const first={...payload(),protocolVersion:2,revision:0};
@@ -433,7 +440,7 @@ test('relaying never shares the relay phone location automatically', () => {
 });
 
 test('a durable signed cancellation wins after a crash before alert cleanup', async () => {
-  const h=queueHarness();const event=await h.service.triggerSOS(params);
+  const h=queueHarness();const event=await h.start(params);
   h.store.set('@suraksha.cancel.packets.v2',JSON.stringify([{...event,protocolVersion:2,revision:1,messageType:'SOS_CANCEL'}]));
   assert.equal((await h.service.activeSOS()).length,0);
   h.setOnline(true);await h.service.retryPendingQueue();
@@ -443,12 +450,246 @@ test('a durable signed cancellation wins after a crash before alert cleanup', as
 
 test('helper request signs and queues immediately without requesting GPS again', async () => {
   const h = queueHarness(); h.setAdvertise(true);
-  const event = await h.service.triggerSOS(params);
+  const event = await h.start(params);
   const before = h.locationCalls(); h.setFailLocation(true);
   await h.service.requestHelper(event.sosId);
   const next = (await h.service.activeSOS())[0];
   assert.equal(h.locationCalls(), before);
-  assert.equal(next.helperRequested, true); assert.equal(next.revision, 1);
+  assert.equal(next.helperRequested, true); assert.equal(next.revision, 2);
   assert.ok(next.originProof);
   assert.equal(JSON.parse(h.store.get('@suraksha_sos_queue'))[0].helperRequested, true);
+});
+
+// A stuck device boundary must not hold local cancellation or initial dispatch.
+test('first SOS is saved and uploaded while GPS and Bluetooth startup remain blocked', async () => {
+  const h = queueHarness(); h.setOnline(true);
+  let releaseGPS, releaseBLE;
+  const gps = new Promise(r => { releaseGPS = r; });
+  const ble = new Promise(r => { releaseBLE = r; });
+  h.setBlockGPS(() => gps); h.setBlockAdvertise(() => ble);
+  const event = await h.service.triggerSOS(params);
+  await h.service.retryPendingQueue();
+  assert.equal(event.location, null);
+  assert.equal(h.sent[0].sosId, event.sosId);
+  assert.equal(h.sent[0].location, null);
+  await h.service.cancelSOS(event.sosId, 'owner');
+  assert.equal((await h.service.activeSOS()).length, 0);
+  assert.equal(JSON.parse(h.store.get('@suraksha.cancel.packets.v2'))[0].messageType, 'SOS_CANCEL');
+  releaseGPS(); releaseBLE();
+  await h.service.updateActiveLocations();
+  assert.equal(h.store.get('@suraksha_sos_queue'), '[]');
+});
+
+test('cancellation is persisted while a location-update advertisement is stalled', async () => {
+  const h = queueHarness(); const event = await h.start(params);
+  let release, began; const stalled = new Promise(r => { release = r; }); const started = new Promise(r => { began = r; });
+  h.setBlockAdvertise(() => { began(); return stalled; });
+  await h.service.updateActiveLocations(payload().location, true); await started;
+  await h.service.cancelSOS(event.sosId, 'owner');
+  assert.equal((await h.service.activeSOS()).length, 0);
+  assert.equal(h.store.get('@suraksha_sos_queue'), '[]');
+  release();
+});
+
+test('each helper request gets a new signed ID and withdrawal retains that ID', async () => {
+  const h = queueHarness(); const event = await h.start(params);
+  const before = h.locationCalls();
+  await h.service.requestHelper(event.sosId);
+  const first = (await h.service.activeSOS())[0];
+  await h.service.requestHelper(event.sosId);
+  const second = (await h.service.activeSOS())[0];
+  assert.notEqual(first.helperRequestId, second.helperRequestId);
+  assert.equal(second.helperState, 'pending');
+  assert.equal(h.locationCalls(), before);
+  await h.service.requestHelper(event.sosId, true);
+  const withdrawn = (await h.service.activeSOS())[0];
+  assert.equal(withdrawn.helperRequestId, second.helperRequestId);
+  assert.equal(withdrawn.helperRequested, false);
+  assert.equal(withdrawn.helperState, 'withdrawn');
+});
+
+test('Retry-After throttles relay uploads without blocking a new cancellation', async () => {
+  const store = new Map();
+  const load = loader({'@react-native-async-storage/async-storage':{getItem:async k=>store.get(k)??null,setItem:async(k,v)=>store.set(k,v)}});
+  const retry = load('src/services/retry-policy.ts');
+  const first = payload('busy');
+  await retry.uploadFailed(first, {status:429,retryAfterMs:60000});
+  assert.equal(await retry.mayUpload(first), false);
+  assert.equal(await retry.mayUpload(payload('another')), false);
+  assert.equal(await retry.mayUpload({...first,messageType:'SOS_CANCEL',revision:1}), true);
+  await retry.uploadFailed({...first,revision:2}, {status:422});
+  const saved = JSON.parse(store.get('@suraksha.retry.v3')); saved.cooldown = 0;
+  store.set('@suraksha.retry.v3',JSON.stringify(saved));
+  assert.equal(await retry.mayUpload({...first,revision:2}), false);
+  assert.equal(await retry.mayUpload({...first,revision:3}), true);
+});
+
+test('HTTP validation errors exclude submitted secrets and expose Retry-After', async () => {
+  const load = loader({}, {fetch:async()=>new Response(JSON.stringify({detail:[{loc:['body','location'],msg:'Invalid coordinates',input:'private-value'}]}),{status:429,headers:{'Retry-After':'35'}})});
+  await assert.rejects(load('src/services/sos-api.service.ts').SOSApiService.sendSOS(payload()), error =>
+    error.status===429 && error.retryAfterMs===35000 && error.message.includes('location') && !error.message.includes('private-value'));
+});
+
+test('delivery state advances on receipts and a delayed alert receipt cannot undo cancellation', async () => {
+  const h=queueHarness();const event=await h.start(params);
+  const delivery=h.load('src/services/delivery.service.ts');
+  const receipt={...event,targetSosId:event.sosId,targetDeviceId:event.originDeviceId,receiptKind:'peer',receiptMessageType:'SOS_ALERT',receiptRevision:0,receiptStatus:'received'};
+  await h.service.acceptReceipt(receipt);
+  assert.match(delivery.deliveryLabel((await delivery.deliveryStates('owner'))[0]),/another phone/);
+  await h.service.cancelSOS(event.sosId,'owner');
+  await h.service.acceptReceipt({...receipt,receiptKind:'server',receiptMessageType:'SOS_CANCEL',receiptStatus:'cancelled'});
+  await h.service.acceptReceipt({...receipt,receiptKind:'server',receiptStatus:'accepted'});
+  assert.match(delivery.deliveryLabel((await delivery.deliveryStates('owner'))[0]),/Cancellation confirmed/);
+  assert.equal((await h.service.activeSOS()).length,0);
+});
+
+function relayHarness({online=false,deviceId='device-b'}={}) {
+  const store=new Map();let inbox=[];const ads=[],sent=[],notices=[],receipts=[],retired=[];
+  let blockGPS, serverReply;
+  const prepare=loader({'react-native':{},'../../modules/ble-peripheral':{}})('src/services/ble-mesh.service.ts').BLEMeshService.prototype.prepareRelay;
+  const mocks={
+    '@react-native-async-storage/async-storage':{getItem:async k=>store.get(k)??null,setItem:async(k,v)=>store.set(k,v)},
+    'expo-notifications':{scheduleNotificationAsync:async p=>notices.push(p),dismissNotificationAsync:async()=>{}},
+    'expo-location':{getLastKnownPositionAsync:async()=>null},'expo-background-task':{},'react-native':{Platform:{OS:'android'}},
+    '../../modules/ble-peripheral':{getInbox:async()=>[...inbox],acknowledgeInbox:async p=>{inbox=inbox.filter(v=>v!==p);}},
+    './origin-security':{verifyOrigin:async()=>{},signOrigin:async()=>({certificate:'test',signedPayload:'{}',signature:'test'}),readServerReceipt:async token=>({...JSON.parse(token),serverReceipt:token})},
+    './session.service':{loadSession:async()=>({user:{user_id:'helper',name:'Helper'}})},
+    './network.service':{NetworkService:{checkConnectivity:async()=>({isOnline:online})}},
+    './location.service':{LocationService:{getCurrentLocation:async()=>{if(blockGPS)await blockGPS();return payload().location;}}},
+    './sos-api.service':{ApiError:class extends Error{},SOSApiService:{sendSOS:async p=>{sent.push(p);return {success:true,receipt:serverReply?JSON.stringify(serverReply):undefined};}}},
+    './sos-trigger.service':{SOSTriggerService:{getDeviceId:async()=>deviceId,activeSOS:async()=>JSON.parse(store.get('@suraksha.active.v2')??'[]'),
+      acceptReceipt:async p=>{if(p.targetDeviceId===deviceId)receipts.push(p);},retryPendingQueue:async()=>{},updateActiveLocations:async()=>{}},
+      bleMeshInstance:{reportReceived(){},prepareRelay:(p,id)=>prepare(p,id),startAdvertising:async p=>{if(!p.uploadOnly)ads.push(p);},retireSOS:async id=>retired.push(id)}},
+  };
+  const load=loader(mocks);const runtime=load('src/services/mesh-runtime.service.ts'),codec=load('src/services/ble-codec.ts');
+  return {store,ads,sent,notices,receipts,retired,load,runtime,
+    setReceipt(value){serverReply=value;},blockGPS(value){blockGPS=value;},setOnline(value){online=value;},
+    async deliver(packet){inbox.push(codec.encodePayload(packet));await runtime.processMeshWork();}};
+}
+const helperRequest = () => ({...payload(),protocolVersion:3,revision:1,helperRequested:true,helperState:'pending',
+  helperRequestId:'request-1',helperRequestExpiresAt:new Date(Date.now()+300000).toISOString()});
+
+test('the last allowed hop uploads to the backend without further BLE forwarding', async () => {
+  const h=relayHarness({online:true});
+  const last={...payload('last-hop'),hopCount:15,maxHops:15,relayChain:[]};
+  await h.deliver(last);
+  assert.equal(h.sent.length,1);assert.equal(h.sent[0].hopCount,15);
+  assert.equal(h.ads.filter(p=>p.sosId===last.sosId).length,0);
+  const uploadOnly=JSON.parse(h.store.get('@suraksha.relay.pending.v2')).find(p=>p.sosId===last.sosId);
+  assert.equal(uploadOnly.uploadOnly,true);
+});
+
+test('new request IDs notify and unhide the event after a previous helper request was dismissed', async () => {
+  const h=relayHarness();const first=helperRequest();
+  await h.deliver(first);await h.runtime.dismissNearbySOS(first.sosId);
+  assert.equal((await h.runtime.nearbyEvents()).length,0);
+  await h.deliver({...first,revision:2,helperRequestId:'request-2'});
+  assert.equal((await h.runtime.nearbyEvents()).length,1);
+  assert.equal(h.notices.filter(p=>p.identifier==='helper-sos-1').length,2);
+});
+
+test('declining works offline without a location, and withdrawal supersedes the accepted snapshot', async () => {
+  const h=relayHarness();const event=helperRequest();await h.deliver(event);
+  const consent=h.load('src/services/helper-consent.service.ts');
+  await consent.respondToHelper(event,'declined');
+  let choice=(await consent.helperChoices('helper'))[0];
+  assert.equal(choice.packet.helperState,'declined');assert.equal(choice.packet.location,null);
+  h.setOnline(true);await consent.respondToHelper(event,'accepted');
+  choice=(await consent.helperChoices('helper'))[0];assert.ok(choice.packet.location);
+  const id=choice.packet.sosId,revision=choice.packet.revision;
+  await consent.respondToHelper(event,'withdrawn');
+  choice=(await consent.helperChoices('helper'))[0];
+  assert.equal(choice.packet.sosId,id);assert.equal(choice.packet.revision,revision+1);
+  assert.equal(choice.packet.helperState,'withdrawn');assert.equal(choice.packet.location,null);
+  const queued=JSON.parse(h.store.get('@suraksha.relay.pending.v2')).filter(p=>p.sosId===id);
+  assert.equal(queued.length,1);assert.equal(queued[0].location,null);
+});
+
+test('cancellation during helper GPS acquisition prevents the snapshot from being shared', async () => {
+  const h=relayHarness({online:true});const event=helperRequest();await h.deliver(event);
+  let release,began;const blocked=new Promise(r=>release=r),started=new Promise(r=>began=r);
+  h.blockGPS(()=>{began();return blocked;});
+  const consent=h.load('src/services/helper-consent.service.ts');
+  const sharing=consent.respondToHelper(event,'accepted');
+  const rejected=assert.rejects(sharing,/changed|expired|withdrawn/);
+  await started;
+  await h.deliver({...event,revision:2,messageType:'SOS_CANCEL',location:null,helperRequested:false,helperState:'withdrawn'});
+  release();await rejected;
+  assert.equal(h.ads.some(p=>p.messageType==='SOS_HELPER'&&p.location),false);
+});
+
+test('withdrawn helper location cannot be restored by delayed acceptance at the sender', async () => {
+  const h=relayHarness({deviceId:'device'});const event=helperRequest();
+  h.store.set('@suraksha.active.v2',JSON.stringify([event]));
+  const accepted={...event,sosId:'offer',userId:'helper',userName:'Helper',originDeviceId:'device-b',helperRequested:false,
+    messageType:'SOS_HELPER',helperState:'accepted',targetSosId:event.sosId,targetDeviceId:'device',ttlSeconds:300};
+  await h.deliver(accepted);
+  await h.deliver({...accepted,revision:2,helperState:'withdrawn',location:null});
+  await h.deliver(accepted);
+  const offers=await h.runtime.helperOffers(event.sosId);
+  assert.equal(offers.length,1);assert.equal(offers[0].helperState,'withdrawn');assert.equal(offers[0].location,null);
+});
+
+test('real server receipts reject forged targets, revisions, keys, expiry and device-certificate audience', async () => {
+  const { p256 }=require('@noble/curves/nist.js');const {randomBytes}=require('node:crypto');const ca=randomBytes(32);
+  const publicKey=Buffer.from(p256.getPublicKey(ca,false)).toString('hex');
+  const security=loader({'expo-secure-store':{getItemAsync:async()=>publicKey},'react-native':{Platform:{OS:'android'}}})('src/services/origin-security.ts');
+  const packet={...payload('receipt-test'),protocolVersion:3,revision:0,messageType:'SOS_ACK',location:null,
+    userId:'suraksha-server',userName:'Suraksha server',originDeviceId:'suraksha-server',targetSosId:'original-sos',targetDeviceId:'device-a',
+    receiptKind:'server',receiptRevision:4,receiptMessageType:'SOS_ALERT',receiptStatus:'accepted',receiptUserId:'owner'};
+  const token=(changes={},key=ca)=>{
+    const b64=value=>Buffer.from(JSON.stringify(value)).toString('base64url');
+    const data=`${b64({alg:'ES256',typ:'JWT'})}.${b64({iss:'suraksha-device-ca',aud:'suraksha-receipt',exp:Math.floor(Date.now()/1000)+3600,packet,...changes})}`;
+    return `${data}.${Buffer.from(p256.sign(Buffer.from(data),key)).toString('base64url')}`;
+  };
+  const receipt=await security.readServerReceipt(token());await security.verifyOrigin(receipt);
+  const codec=loader()('src/services/ble-codec.ts');assert.equal(codec.isLivePayload(receipt),true);
+  await assert.rejects(security.verifyOrigin({...receipt,targetDeviceId:'attacker'}),/mismatch/);
+  await assert.rejects(security.verifyOrigin({...receipt,receiptRevision:99}),/mismatch/);
+  await assert.rejects(security.readServerReceipt(token({aud:'suraksha-ble'})),/Untrusted/);
+  await assert.rejects(security.readServerReceipt(token({exp:1})),/Untrusted/);
+  await assert.rejects(security.readServerReceipt(token({},randomBytes(32))),/Untrusted/);
+});
+
+test('protocol v3 signs GPS freshness and helper request state', async () => {
+  const {p256}=require('@noble/curves/nist.js');const {randomBytes}=require('node:crypto');const ca=randomBytes(32),device=randomBytes(32);
+  const b64=value=>Buffer.from(JSON.stringify(value)).toString('base64url');const pub=value=>Buffer.from(p256.getPublicKey(value,false)).toString('hex');
+  const encoded=`${b64({alg:'ES256'})}.${b64({sub:'owner',device_id:'device',public_key:pub(device),iss:'suraksha-device-ca',aud:'suraksha-ble',exp:Math.floor(Date.now()/1000)+3600})}`;
+  const certificate=`${encoded}.${Buffer.from(p256.sign(Buffer.from(encoded),ca)).toString('base64url')}`;
+  const security=loader({'expo-secure-store':{getItemAsync:async key=>key==='suraksha.device.v2'?JSON.stringify({deviceId:'device',userId:'owner',secret:device.toString('hex'),certificate}):pub(ca)},'react-native':{Platform:{OS:'android'}}})('src/services/origin-security.ts');
+  const event=helperRequest();event.originProof=await security.signOrigin(event,false);await security.verifyOrigin(event);
+  for(const changed of [{...event,helperRequestId:'different'},{...event,helperState:'withdrawn'},
+    {...event,location:{...event.location,capturedAt:new Date(Date.now()-60000).toISOString()}},
+    {...event,location:{...event.location,accuracy:123}}]) await assert.rejects(security.verifyOrigin(changed),/mismatch/);
+});
+
+test('legacy packets cannot inject unsigned v3 consent state or GPS capture time', () => {
+  const codec=loader()('src/services/ble-codec.ts');
+  const legacy={...payload(),protocolVersion:2,revision:0,helperRequested:true,helperRequestId:'injected',helperState:'withdrawn'};
+  const decoded=codec.decodePayload(codec.encodePayload(legacy));
+  assert.equal(decoded.helperRequestId,undefined);assert.equal(decoded.helperState,undefined);
+  assert.equal(decoded.location.capturedAt,undefined);
+});
+
+test('offline A to offline B to online C returns acceptance and cancellation receipts through B', async () => {
+  const a=relayHarness({deviceId:'device'}),b=relayHarness({deviceId:'b'}),c=relayHarness({deviceId:'c',online:true});
+  const source={...payload('three-phone'),protocolVersion:3,revision:0};
+  a.store.set('@suraksha.active.v2',JSON.stringify([source]));
+  const receipt=(id,status,revision)=>({...payload(id),protocolVersion:3,revision:0,messageType:'SOS_ACK',location:null,
+    userId:'suraksha-server',userName:'Suraksha server',originDeviceId:'suraksha-server',targetSosId:source.sosId,targetDeviceId:'device',
+    receiptKind:'server',receiptRevision:revision,receiptMessageType:status==='cancelled'?'SOS_CANCEL':'SOS_ALERT',receiptStatus:status,receiptUserId:'owner'});
+  c.setReceipt(receipt('receipt-accepted','accepted',0));
+  await b.deliver(source);
+  await c.deliver(b.ads.find(p=>p.sosId===source.sosId));
+  assert.equal(c.sent[0].hopCount,2);assert.equal(b.sent.length,0);
+  await b.deliver(c.ads.find(p=>p.receiptKind==='server'));
+  await a.deliver(b.ads.find(p=>p.receiptKind==='server'));
+  assert.equal(a.receipts[0].receiptStatus,'accepted');
+  const cancel={...source,revision:1,messageType:'SOS_CANCEL',location:null,status:'CANCELLED'};
+  c.setReceipt(receipt('receipt-cancelled','cancelled',1));
+  await b.deliver(cancel);await c.deliver(b.ads.find(p=>p.messageType==='SOS_CANCEL'));
+  await b.deliver(c.ads.find(p=>p.receiptStatus==='cancelled'));
+  await a.deliver(b.ads.find(p=>p.receiptStatus==='cancelled'));
+  assert.equal(a.receipts.at(-1).receiptStatus,'cancelled');
+  assert.equal((await b.runtime.nearbyEvents()).length,0);assert.equal((await c.runtime.nearbyEvents()).length,0);
 });

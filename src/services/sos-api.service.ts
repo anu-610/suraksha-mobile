@@ -2,12 +2,13 @@ import { SOSPayload, SOSCancellation, SOSResponse, ActiveSOSEvent, SOSLocation, 
 import { sessionToken } from './session.service';
 import { apiUrl, loadApiSettings } from '../constants/api';
 
-type WireResponse = { success: boolean; sos_id: string; message: string; is_duplicate: boolean; server_timestamp: string };
-const wireLocation = (location: SOSLocation) => ({ ...location, lat: location.latitude, lng: location.longitude });
+type WireResponse = { success: boolean; sos_id: string; message: string; is_duplicate: boolean; server_timestamp: string; receipt?: string };
+const wireLocation = (location: SOSLocation) => ({ ...location, lat: location.latitude, lng: location.longitude, captured_at: location.capturedAt });
 export const toWirePayload = (payload: SOSPayload) => ({
   origin_proof: payload.originProof ? { certificate: payload.originProof.certificate,
     signed_payload: payload.originProof.signedPayload, signature: payload.originProof.signature } : undefined,
   protocol_version: payload.protocolVersion, revision: payload.revision ?? 0, helper_requested: payload.helperRequested ?? false,
+  helper_request_id: payload.helperRequestId, helper_request_expires_at: payload.helperRequestExpiresAt, helper_state: payload.helperState,
   sos_id: payload.sosId, user_id: payload.userId, user_name: payload.userName,
   user_phone: payload.userPhone, sos_type: payload.sosType, message_type: payload.messageType,
   location: payload.location ? wireLocation(payload.location) : null, delivery_method: payload.deliveryMethod,
@@ -19,7 +20,7 @@ export const toWirePayload = (payload: SOSPayload) => ({
 });
 
 export class ApiError extends Error {
-  constructor(message: string, public status: number) { super(message); }
+  constructor(message: string, public status: number, public retryAfterMs?: number, public receipt?: string) { super(message); }
 }
 
 export class SOSApiService {
@@ -43,8 +44,10 @@ export class SOSApiService {
         let data;
         try { data = text ? JSON.parse(text) : {}; } catch { data = {}; }
         if (!response.ok) {
-          const detail = typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail || data.message || `HTTP ${response.status}`);
-          throw new ApiError(detail, response.status);
+          const detail = typeof data.detail === 'string' ? data.detail : Array.isArray(data.detail) ? data.detail.map((item: { loc?: string[]; msg?: string }) => `${item.loc?.join('.')}: ${item.msg}`).join('; ') : data.detail?.message || data.message || `HTTP ${response.status}`;
+          const retry = response.headers.get('Retry-After');
+          const retryMs = retry ? (/^\d+$/.test(retry) ? Number(retry) * 1000 : Date.parse(retry) - Date.now()) : undefined;
+          throw new ApiError(detail, response.status, retryMs !== undefined && Number.isFinite(retryMs) ? Math.max(1000, Math.min(3600000, retryMs)) : undefined, data.detail?.receipt);
         }
         return data as T;
       } catch (error) {
@@ -57,7 +60,7 @@ export class SOSApiService {
   private static result(data: WireResponse): SOSResponse {
     if (!data.success) throw new Error(data.message || 'Server rejected the SOS operation');
     return { success: data.success, sosId: data.sos_id, message: data.message,
-      isDuplicate: data.is_duplicate, serverTimestamp: data.server_timestamp };
+      isDuplicate: data.is_duplicate, serverTimestamp: data.server_timestamp, receipt: data.receipt };
   }
 
   public static async sendSOS(payload: SOSPayload): Promise<SOSResponse> {
@@ -73,12 +76,12 @@ export class SOSApiService {
   }
 
   public static async getActiveSOS(lat: number, lng: number, radiusKm: number, authToken?: string): Promise<ActiveSOSEvent[]> {
-    type WireLocation = { lat: number; lng: number; accuracy?: number; provider?: SOSLocation['provider'] };
+    type WireLocation = { lat: number; lng: number; accuracy?: number; provider?: SOSLocation['provider']; captured_at?: string };
     type WireEvent = ReturnType<typeof toWirePayload> & { id: string; status: ActiveSOSEvent['status'];
       created_at: string; distance_meters?: number; acknowledged_by?: string[]; responders_en_route?: number };
     const events = await this.request<WireEvent[]>(`/sos/active?lat=${lat}&lng=${lng}&radius_km=${radiusKm}`, { method: 'GET' }, authToken);
     const location = (value: WireLocation): SOSLocation => ({ ...value, latitude: value.lat, longitude: value.lng,
-      accuracy: value.accuracy ?? 0, provider: value.provider ?? 'network' });
+      accuracy: value.accuracy ?? 0, provider: value.provider ?? 'network', capturedAt: value.captured_at });
     return events.map(event => ({
       sosId: event.sos_id, userId: event.user_id, userName: event.user_name, userPhone: event.user_phone ?? '',
       sosType: event.sos_type, messageType: event.message_type, location: event.location ? location(event.location) : null,

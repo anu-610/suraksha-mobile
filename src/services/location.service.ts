@@ -2,6 +2,10 @@ import * as Location from 'expo-location';
 import { SOSLocation } from '../interfaces/sos.types';
 
 export class LocationService {
+  private static cached: SOSLocation | null = null;
+  public static availableLocation(): SOSLocation | null {
+    return this.cached?.capturedAt && Date.now() - Date.parse(this.cached.capturedAt) < 600000 ? this.cached : null;
+  }
   public static async getCurrentLocation(requestPermission = true): Promise<SOSLocation> {
     const permission = await (requestPermission ? Location.requestForegroundPermissionsAsync() : Location.getForegroundPermissionsAsync());
     if (!permission.granted) throw new Error('Location permission is required to send accurate SOS coordinates.');
@@ -19,8 +23,16 @@ export class LocationService {
       position = cached;
       provider = 'last_known';
     } finally { if (timer) clearTimeout(timer); }
-    return { latitude: position.coords.latitude, longitude: position.coords.longitude,
+    this.cached = { latitude: position.coords.latitude, longitude: position.coords.longitude, capturedAt: new Date(position.timestamp).toISOString(),
       altitude: position.coords.altitude ?? undefined, accuracy: position.coords.accuracy ?? 1000,
       heading: position.coords.heading ?? undefined, speed: position.coords.speed ?? undefined, provider };
+    return this.cached;
   }
+}
+
+export function locationDescription(location: SOSLocation | null): string {
+  if (!location) return 'Location unavailable';
+  const age = location.capturedAt ? Math.max(0, Math.floor((Date.now() - Date.parse(location.capturedAt)) / 1000)) : null;
+  const freshness = age === null ? 'capture time unknown' : age < 60 ? `${age}s ago` : `${Math.floor(age / 60)} min ago`;
+  return `${age === null || age > 120 || location.provider === 'last_known' ? 'Last known location' : 'GPS location'} · ${freshness} · accuracy ±${Math.round(location.accuracy)} m`;
 }

@@ -1,13 +1,15 @@
-import { signOrigin } from './origin-security';
+import { signOrigin, readServerReceipt } from './origin-security';
 import * as Crypto from 'expo-crypto';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { LocationService } from './location.service';
 import { NetworkService } from './network.service';
 import { SOSApiService, ApiError } from './sos-api.service';
 import { BLEMeshService } from './ble-mesh.service';
-import { SOSPayload, SOSType, SOSStatus, DeliveryMethod, SOSMessageType, SOSCancellation, SOSLocation } from '../interfaces/sos.types';
+import { SOSPayload, SOSType, SOSStatus, DeliveryMethod, SOSMessageType, SOSCancellation, SOSLocation, SOSResponse } from '../interfaces/sos.types';
 import { isLivePayload } from './ble-codec';
 import { SOS_TTL_SECONDS, MAX_HOP_COUNT } from '../constants/ble.constants';
+import { recordSaved, recordReceipt, recordDeliveryError } from './delivery.service';
+import { mayUpload, uploadFailed, uploadSucceeded } from './retry-policy';
 
 const ACTIVE_KEY = '@suraksha.active.v2';
 const CANCEL_PACKETS = '@suraksha.cancel.packets.v2';
@@ -16,89 +18,69 @@ const CANCEL_KEY = '@suraksha_sos_cancellations';
 const DEVICE_KEY = '@suraksha_device_id';
 export const bleMeshInstance = new BLEMeshService();
 
-function uuid(): string { return Crypto.randomUUID(); }
-
 export class SOSTriggerService {
-  // Serialize read-modify-write operations and network retries to prevent lost updates.
+  // Only local read/modify/write work belongs in this lock. Never await radio,
+  // GPS, permission prompts, or HTTP while holding it.
   private static operations: Promise<unknown> = Promise.resolve();
   private static exclusive<T>(action: () => Promise<T>): Promise<T> {
-    const next = this.operations.then(action, action);
-    this.operations = next.catch(() => undefined);
-    return next;
+    const next = this.operations.then(action, action); this.operations = next.catch(() => undefined); return next;
   }
   private static async read<T>(key: string): Promise<T[]> {
-    const raw = await AsyncStorage.getItem(key);
-    if (!raw) return [];
-    const parsed: unknown = JSON.parse(raw);
+    const parsed: unknown = JSON.parse(await AsyncStorage.getItem(key) ?? '[]');
     if (!Array.isArray(parsed)) throw new Error('Stored SOS queue is invalid; it has been preserved.');
     return parsed as T[];
   }
   private static deviceIdPromise: Promise<string> | undefined;
   public static getDeviceId(): Promise<string> {
-    if (this.deviceIdPromise) return this.deviceIdPromise;
-    this.deviceIdPromise = (async () => {
+    return this.deviceIdPromise ??= (async () => {
       let id = await AsyncStorage.getItem(DEVICE_KEY);
-      if (!id) { id = uuid(); await AsyncStorage.setItem(DEVICE_KEY, id); }
+      if (!id) { id = Crypto.randomUUID(); await AsyncStorage.setItem(DEVICE_KEY, id); }
       return id;
     })().catch(error => { this.deviceIdPromise = undefined; throw error; });
-    return this.deviceIdPromise;
+  }
+  private static broadcast(payload: SOSPayload) {
+    void bleMeshInstance.startAdvertising(payload).catch(() => undefined);
   }
   public static async triggerSOS(params: { userId: string; userName: string; userPhone: string;
     authToken?: string; sosType: SOSType; message?: string }): Promise<SOSPayload> {
-    if (!params.userId.trim() || !params.userName.trim()) throw new Error('Enter your user ID and name before sending an SOS.');
+    if (!params.userId.trim() || !params.userName.trim()) throw new Error('Sign in before sending an SOS.');
     if (params.authToken) SOSApiService.setAuthToken(params.authToken);
-    // GPS works offline; a failed fix must never prevent an emergency alert.
-    const { isOnline } = await NetworkService.checkConnectivity().catch(() => ({ isOnline: false }));
-    const location = await LocationService.getCurrentLocation().catch(() => null);
-    const originDeviceId = await this.getDeviceId();
     const timestamp = new Date().toISOString();
-    const payload: SOSPayload = { protocolVersion: 2, revision: 0, sosId: uuid(), userId: params.userId.trim(), userName: params.userName.trim(),
-      userPhone: params.userPhone.trim(), sosType: params.sosType, messageType: SOSMessageType.SOS_ALERT,
-      location, timestamp, createdAt: timestamp, originDeviceId, hopCount: 0, maxHops: MAX_HOP_COUNT,
-      relayChain: [], deliveryMethod: DeliveryMethod.OFFLINE_QUEUED, status: SOSStatus.ACTIVE,
+    const payload: SOSPayload = { protocolVersion: 3, revision: 0, sosId: Crypto.randomUUID(),
+      userId: params.userId.trim(), userName: params.userName.trim(), userPhone: params.userPhone.trim(),
+      sosType: params.sosType, messageType: SOSMessageType.SOS_ALERT,
+      location: LocationService.availableLocation(), timestamp, createdAt: timestamp,
+      originDeviceId: await this.getDeviceId(), hopCount: 0, maxHops: MAX_HOP_COUNT, relayChain: [],
+      deliveryMethod: DeliveryMethod.OFFLINE_QUEUED, status: SOSStatus.ACTIVE,
       message: params.message, ttlSeconds: SOS_TTL_SECONDS };
-    payload.originProof = await signOrigin(payload, isOnline);
+    // Enrollment is done at sign-in. A network-dependent renewal must not delay SOS.
+    payload.originProof = await signOrigin(payload, false);
     await this.exclusive(async () => {
-      const queue = await this.read<SOSPayload>(QUEUE_KEY);
-      queue.push(payload);
       const active = await this.read<SOSPayload>(ACTIVE_KEY);
+      const queue = await this.read<SOSPayload>(QUEUE_KEY);
       await AsyncStorage.setItem(ACTIVE_KEY, JSON.stringify([...active, payload]));
-      await AsyncStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
+      await AsyncStorage.setItem(QUEUE_KEY, JSON.stringify([...queue, payload]));
     });
-      // Start local discovery immediately, including when the backend is online.
-      // Upload success does not retract the nearby alert; cancellation/TTL does.
-      let broadcasting = false;
-      try {
-        await bleMeshInstance.requestPermissions(true);
-        await bleMeshInstance.startAdvertising({ ...payload, deliveryMethod: DeliveryMethod.BLE_RELAY });
-        broadcasting = true;
-      } catch { /* Online delivery still works without Bluetooth. */ }
-      try {
-        if (isOnline) {
-          await SOSApiService.sendSOS({ ...payload, deliveryMethod: DeliveryMethod.DIRECT_ONLINE });
-          await this.exclusive(() => this.remove(payload.sosId, payload.revision ?? 0));
-          return { ...payload, deliveryMethod: DeliveryMethod.DIRECT_ONLINE };
-        }
-      } catch (error) {
-        if (error instanceof ApiError && error.status < 500) {
-          // Stop this advert if the server explicitly rejects the submission.
-          await bleMeshInstance.stopAdvertising(payload.sosId).catch(() => undefined);
-          throw new Error(`${error.message}. Alert retained locally for retry after correction.`);
-        }
-      }
-      return broadcasting ? { ...payload, deliveryMethod: DeliveryMethod.BLE_RELAY } : payload;
-
+    await recordSaved(payload);
+    void bleMeshInstance.requestPermissions(true).then(() => this.broadcast(payload)).catch(() => undefined);
+    void this.retryPendingQueue().catch(() => undefined);
+    // Sending and fresh GPS run independently. Failure to get a fix never delays
+    // the first packet; a successful fix produces a signed higher revision.
+    void this.updateActiveLocations(undefined, true).catch(() => undefined);
+    return payload;
   }
   public static async cancelSOS(sosId: string, userId: string, reason?: string, authToken?: string): Promise<boolean> {
     if (authToken) SOSApiService.setAuthToken(authToken);
     const cancellation: SOSCancellation = { sosId, userId, reason, cancelledAt: new Date().toISOString() };
+    let packet: SOSPayload | undefined;
     await this.exclusive(async () => {
       const active = await this.read<SOSPayload>(ACTIVE_KEY);
       const source = active.find(item => item.sosId === sosId && item.userId === userId);
       if (source) {
-        const packet: SOSPayload = { ...source, protocolVersion: 2, revision: (source.revision ?? 0) + 1,
+        packet = { ...source, protocolVersion: 3, revision: (source.revision ?? 0) + 1,
           messageType: SOSMessageType.SOS_CANCEL, status: SOSStatus.CANCELLED,
           timestamp: cancellation.cancelledAt, location: null, helperRequested: false,
+          helperState: source.helperRequestId ? 'withdrawn' : undefined,
           message: reason, hopCount: 0, relayChain: [] };
         packet.originProof = await signOrigin(packet, false);
         const packets = await this.read<SOSPayload>(CANCEL_PACKETS);
@@ -106,77 +88,83 @@ export class SOSTriggerService {
       }
       await AsyncStorage.setItem(ACTIVE_KEY, JSON.stringify(active.filter(item => item.sosId !== sosId)));
       const pending = await this.read<SOSCancellation>(CANCEL_KEY);
-      // Persist first. Queue uploads check this tombstone before every send.
       await AsyncStorage.setItem(CANCEL_KEY, JSON.stringify([...pending.filter(item => item.sosId !== sosId), cancellation]));
       await this.remove(sosId);
     });
-    // Local cancellation is durable. Radio and HTTP completion must not hold the UI.
-    void this.broadcastCancellations().catch(() => undefined);
+    if (packet) { await recordSaved(packet); this.broadcast(packet); }
     void this.retryPendingQueue().catch(() => undefined);
-    return false; // Server confirmation is pending, never imply BLE delivery was acknowledged.
+    return false; // UI watches durable delivery state for later confirmation.
   }
   public static async activeSOS(): Promise<SOSPayload[]> {
     const cancelled = await this.read<SOSPayload>(CANCEL_PACKETS);
     return (await this.read<SOSPayload>(ACTIVE_KEY)).filter(p => isLivePayload(p) && !cancelled.some(c => c.sosId === p.sosId));
   }
-  public static async requestHelper(sosId: string): Promise<void> {
+  public static async requestHelper(sosId: string, withdraw = false): Promise<void> {
+    let next: SOSPayload | undefined;
     await this.exclusive(async () => {
       const active = await this.read<SOSPayload>(ACTIVE_KEY);
       const item = active.find(p => p.sosId === sosId && isLivePayload(p));
       if (!item) throw new Error('SOS is no longer active');
-      const next: SOSPayload = { ...item, helperRequested: true, protocolVersion: 2,
-        revision: (item.revision ?? 0) + 1, hopCount: 0, relayChain: [] };
+      next = { ...item, protocolVersion: 3, revision: (item.revision ?? 0) + 1,
+        helperRequested: !withdraw, helperState: withdraw ? 'withdrawn' : 'pending',
+        helperRequestId: withdraw ? item.helperRequestId : Crypto.randomUUID(),
+        helperRequestExpiresAt: withdraw ? item.helperRequestExpiresAt : new Date(Date.now() + 300000).toISOString(),
+        hopCount: 0, relayChain: [] };
       next.originProof = await signOrigin(next, false);
       await AsyncStorage.setItem(ACTIVE_KEY, JSON.stringify(active.map(p => p.sosId === sosId ? next : p)));
       const queue = await this.read<SOSPayload>(QUEUE_KEY);
       await AsyncStorage.setItem(QUEUE_KEY, JSON.stringify([...queue.filter(p => p.sosId !== sosId), next]));
     });
-    // Requesting permission does not need a new GPS fix or an HTTP round trip.
-    const source = (await this.activeSOS()).find(p => p.sosId === sosId);
-    if (source) await bleMeshInstance.startAdvertising(source);
+    if (next) { await recordSaved(next); this.broadcast(next); }
+    void this.retryPendingQueue().catch(() => undefined);
   }
   private static updating: Promise<void> | undefined;
   public static updateActiveLocations(fix?: SOSLocation, force = false): Promise<void> {
-    if (!this.updating) this.updating = this.refreshLocations(fix, force).finally(() => { this.updating = undefined; });
-    return this.updating;
+    return this.updating ??= this.refreshLocations(fix, force).finally(() => { this.updating = undefined; });
   }
   private static async refreshLocations(fix?: SOSLocation, force = false): Promise<void> {
     const due = (await this.activeSOS()).filter(p => force || Date.now() - Date.parse(p.timestamp) >= 60000);
     if (!due.length) return;
     const location = fix ?? await LocationService.getCurrentLocation(false).catch(() => null);
     for (const old of due) {
+      let next: SOSPayload | undefined;
       await this.exclusive(async () => {
         const active = await this.read<SOSPayload>(ACTIVE_KEY);
         const current = active.find(p => p.sosId === old.sosId);
-        if (!current || !isLivePayload(current) || (await this.read<SOSPayload>(CANCEL_PACKETS)).some(p => p.sosId === current.sosId)) return; // Cancel may have completed during GPS acquisition.
-        const next: SOSPayload = { ...current, protocolVersion: 2, revision: (current.revision ?? 0) + 1,
+        if (!current || !isLivePayload(current) || (await this.read<SOSPayload>(CANCEL_PACKETS)).some(p => p.sosId === current.sosId)) return;
+        next = { ...current, protocolVersion: 3, revision: (current.revision ?? 0) + 1,
           timestamp: new Date().toISOString(), location, hopCount: 0, relayChain: [] };
         next.originProof = await signOrigin(next, false);
-        await AsyncStorage.setItem(ACTIVE_KEY, JSON.stringify(active.map(p => p.sosId === next.sosId ? next : p)));
+        await AsyncStorage.setItem(ACTIVE_KEY, JSON.stringify(active.map(p => p.sosId === next!.sosId ? next : p)));
         const queue = await this.read<SOSPayload>(QUEUE_KEY);
-        await AsyncStorage.setItem(QUEUE_KEY, JSON.stringify([...queue.filter(p => p.sosId !== next.sosId), next]));
-        await bleMeshInstance.startAdvertising(next).catch(() => undefined);
+        await AsyncStorage.setItem(QUEUE_KEY, JSON.stringify([...queue.filter(p => p.sosId !== next!.sosId), next]));
       });
+      if (next) { await recordSaved(next); this.broadcast(next); }
     }
   }
-  private static async broadcastCancellations(): Promise<void> {
-    const packets = await this.exclusive(async () => {
-      const live = (await this.read<SOSPayload>(CANCEL_PACKETS)).filter(isLivePayload);
-      await AsyncStorage.setItem(CANCEL_PACKETS, JSON.stringify(live));
-      return live;
+  public static async acceptReceipt(receipt: SOSPayload): Promise<void> {
+    await recordReceipt(receipt);
+    if (receipt.receiptKind !== 'server' || receipt.receiptStatus !== 'cancelled' || receipt.targetDeviceId !== await this.getDeviceId()) return;
+    await this.exclusive(async () => {
+      await AsyncStorage.setItem(ACTIVE_KEY, JSON.stringify((await this.read<SOSPayload>(ACTIVE_KEY)).filter(p => p.sosId !== receipt.targetSosId)));
+      await this.remove(receipt.targetSosId!);
+      await AsyncStorage.setItem(CANCEL_KEY, JSON.stringify((await this.read<SOSCancellation>(CANCEL_KEY)).filter(p => p.sosId !== receipt.targetSosId)));
     });
-    for (const packet of packets) await bleMeshInstance.startAdvertising(packet).catch(() => undefined);
+    // Keep our signed cancellation on air; stop only an obsolete alert.
+    if (!(await this.read<SOSPayload>(CANCEL_PACKETS)).some(p => p.sosId === receipt.targetSosId))
+      void bleMeshInstance.retireSOS(receipt.targetSosId!).catch(() => undefined);
+  }
+  private static async accepted(payload: SOSPayload, response: SOSResponse) {
+    await uploadSucceeded(payload);
+    if (response.receipt) await this.acceptReceipt(await readServerReceipt(response.receipt));
   }
   private static retrying: Promise<void> | undefined;
   public static retryPendingQueue(): Promise<void> {
-    if (!this.retrying) this.retrying = this.flushQueue().finally(() => { this.retrying = undefined; });
-    return this.retrying;
+    return this.retrying ??= this.flushQueue().finally(() => { this.retrying = undefined; });
   }
   private static async flushQueue(): Promise<void> {
-    await this.broadcastCancellations();
-    const { isOnline } = await NetworkService.checkConnectivity().catch(() => ({ isOnline: false }));
-    // A crash after persisting the signed cancel but before pruning the alert must never revive it.
-    await this.exclusive(async () => {
+    // Recover partial cancellation writes before any HTTP attempt.
+    const packets = await this.exclusive(async () => {
       const packets = await this.read<SOSPayload>(CANCEL_PACKETS);
       const active = await this.read<SOSPayload>(ACTIVE_KEY);
       const queue = await this.read<SOSPayload>(QUEUE_KEY);
@@ -184,54 +172,61 @@ export class SOSTriggerService {
       for (const packet of packets) {
         if ([...active, ...queue].some(p => p.sosId === packet.sosId) && !pending.some(p => p.sosId === packet.sosId))
           pending.push({ sosId: packet.sosId, userId: packet.userId, cancelledAt: packet.timestamp, reason: packet.message });
+        await this.remove(packet.sosId);
       }
       await AsyncStorage.setItem(CANCEL_KEY, JSON.stringify(pending));
       await AsyncStorage.setItem(ACTIVE_KEY, JSON.stringify(active.filter(p => !packets.some(c => c.sosId === p.sosId))));
-      for (const packet of packets) await this.remove(packet.sosId);
+      // Retain expired controls until their HTTP cancellation has been confirmed.
+      await AsyncStorage.setItem(CANCEL_PACKETS, JSON.stringify(packets.filter(p => isLivePayload(p) || pending.some(c => c.sosId === p.sosId))));
+      return packets;
     });
+    packets.filter(isLivePayload).forEach(p => this.broadcast(p));
     const cancellations = await this.exclusive(() => this.read<SOSCancellation>(CANCEL_KEY));
-    for (const cancellation of cancellations) {
-      await this.exclusive(() => this.remove(cancellation.sosId));
-      // Keep the cancellation on air while its API retry is pending.
-      if (isOnline) {
-        try {
-          await SOSApiService.cancelSOS(cancellation);
-          await this.exclusive(async () => {
-            const latest = await this.read<SOSCancellation>(CANCEL_KEY);
-            await AsyncStorage.setItem(CANCEL_KEY, JSON.stringify(latest.filter(item => item.sosId !== cancellation.sosId)));
-          });
-        } catch { /* Keep the durable cancellation. */ }
-      }
-    }
-    await this.broadcastCancellations();
     const queue = await this.exclusive(() => this.read<SOSPayload>(QUEUE_KEY));
+    if (!cancellations.length && !queue.length) return;
+    const { isOnline } = await NetworkService.checkConnectivity().catch(() => ({ isOnline: false }));
+    for (const cancellation of cancellations) {
+      const packet = packets.find(p => p.sosId === cancellation.sosId);
+      if (!isOnline || (packet && !await mayUpload(packet))) continue;
+      try {
+        const response = packet && isLivePayload(packet) ? await SOSApiService.sendSOS(packet) : await SOSApiService.cancelSOS(cancellation);
+        if (packet) {
+          await this.accepted(packet, response);
+          if (!response.receipt) await recordReceipt({ ...packet, targetSosId: packet.sosId, targetDeviceId: packet.originDeviceId,
+            receiptKind: 'server', receiptMessageType: SOSMessageType.SOS_CANCEL, receiptStatus: 'cancelled' });
+        }
+        await this.exclusive(async () => {
+          await AsyncStorage.setItem(CANCEL_KEY, JSON.stringify((await this.read<SOSCancellation>(CANCEL_KEY)).filter(p => p.sosId !== cancellation.sosId)));
+        });
+      } catch (error) { if (packet) { await uploadFailed(packet, error); await recordDeliveryError(packet, error instanceof Error ? error.message : 'Cancellation awaiting retry'); } }
+    }
     for (const payload of queue) {
-      // Re-read, because cancellation can happen while another upload is pending.
-      const stillQueued = await this.exclusive(async () =>
-        (await this.read<SOSPayload>(QUEUE_KEY)).some(item => item.sosId === payload.sosId && (item.revision ?? 0) === (payload.revision ?? 0)) &&
-        !(await this.read<SOSCancellation>(CANCEL_KEY)).some(item => item.sosId === payload.sosId));
-      if (!stillQueued) continue;
-      if (!isLivePayload(payload)) {
+      const present = await this.exclusive(async () => (await this.read<SOSPayload>(QUEUE_KEY)).some(p => p.sosId === payload.sosId && p.revision === payload.revision) &&
+        !(await this.read<SOSPayload>(CANCEL_PACKETS)).some(p => p.sosId === payload.sosId));
+      if (!present) continue;
+      if (!isLivePayload(payload)) { await this.exclusive(() => this.remove(payload.sosId, payload.revision ?? 0)); continue; }
+      this.broadcast(payload);
+      if (!isOnline || !await mayUpload(payload)) continue;
+      try {
+        const response = await SOSApiService.sendSOS({ ...payload, authToken: undefined, deliveryMethod: DeliveryMethod.OFFLINE_QUEUED });
+        await this.accepted(payload, response);
+        if (!response.receipt) await recordReceipt({ ...payload, targetSosId: payload.sosId, targetDeviceId: payload.originDeviceId,
+          receiptKind: 'server', receiptRevision: payload.revision ?? 0, receiptMessageType: SOSMessageType.SOS_ALERT, receiptStatus: 'accepted' });
         await this.exclusive(() => this.remove(payload.sosId, payload.revision ?? 0));
-        await bleMeshInstance.stopAdvertising(payload.sosId).catch(() => undefined);
-        continue;
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 410) {
+          if (error.receipt) await this.acceptReceipt(await readServerReceipt(error.receipt));
+          await this.exclusive(async () => {
+            await this.remove(payload.sosId);
+            await AsyncStorage.setItem(ACTIVE_KEY, JSON.stringify((await this.read<SOSPayload>(ACTIVE_KEY)).filter(p => p.sosId !== payload.sosId)));
+          });
+          void bleMeshInstance.retireSOS(payload.sosId).catch(() => undefined);
+        } else { await uploadFailed(payload, error); await recordDeliveryError(payload, error instanceof Error ? error.message : 'Delivery awaiting retry'); }
       }
-      if (isOnline) {
-        try {
-          await SOSApiService.sendSOS({ ...payload, authToken: undefined, deliveryMethod: DeliveryMethod.OFFLINE_QUEUED });
-          await this.exclusive(() => this.remove(payload.sosId, payload.revision ?? 0));
-          continue;
-        } catch { /* Keep undelivered alerts for the next retry. */ }
-      }
-      // Serialize the final presence check and advertise against local cancellation.
-      await this.exclusive(async () => {
-        if ((await this.read<SOSPayload>(QUEUE_KEY)).some(item => item.sosId === payload.sosId && (item.revision ?? 0) === (payload.revision ?? 0)))
-          await bleMeshInstance.startAdvertising({ ...payload, authToken: undefined, deliveryMethod: DeliveryMethod.BLE_RELAY }).catch(() => undefined);
-      });
     }
   }
   private static async remove(sosId: string, revision?: number): Promise<void> {
     const queue = await this.read<SOSPayload>(QUEUE_KEY);
-    await AsyncStorage.setItem(QUEUE_KEY, JSON.stringify(queue.filter(item => item.sosId !== sosId || (revision !== undefined && (item.revision ?? 0) > revision)).map(item => ({ ...item, authToken: undefined }))));
+    await AsyncStorage.setItem(QUEUE_KEY, JSON.stringify(queue.filter(p => p.sosId !== sosId || (revision !== undefined && (p.revision ?? 0) > revision)).map(p => ({ ...p, authToken: undefined }))));
   }
 }

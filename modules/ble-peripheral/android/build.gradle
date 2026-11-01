@@ -13,4 +13,5 @@ android {
 // Headless JS classes are not exported through expo-modules-core.
 dependencies {
   implementation "com.facebook.react:react-android"
+  testImplementation 'junit:junit:4.13.2'
 }

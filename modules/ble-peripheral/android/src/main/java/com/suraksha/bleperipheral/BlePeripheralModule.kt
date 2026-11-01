@@ -144,15 +144,44 @@ internal class MeshEngine(private val context: Context) {
     private var pending: Promise? = null
     private var starting = false
     private val packets = linkedMapOf<String, ByteArray>()
+    private val versions = linkedMapOf<String, ByteArray>()
     private var rotationIndex = 0
+    private var retryDelay = 1000L
+    private val retryRadio = Runnable { synchronized(this) { try { resumeAdvertisements() } catch (error: Exception) { failAdvertising(error.message ?: "Bluetooth restart failed") } } }
+    private fun scheduleRadioRetry() {
+        if (packets.isEmpty()) return
+        handler.removeCallbacks(retryRadio)
+        handler.postDelayed(retryRadio, retryDelay)
+        retryDelay = minOf(30000L, retryDelay * 2)
+    }
+    private fun objectData(bytes: ByteArray) = org.json.JSONObject(String(bytes, Charsets.UTF_8))
+    private fun version(bytes: ByteArray): PacketVersion {
+        val p = objectData(bytes)
+        return PacketVersion(p.getString("userId"), p.getString("messageType"), p.optLong("revision", 0),
+            java.time.Instant.parse(p.getString("timestamp")).toEpochMilli(), p.optString("helperState", ""))
+    }
+    private fun priority(bytes: ByteArray): Int {
+        val p = objectData(bytes)
+        return PacketPolicy.priority(p.getString("messageType"), p.optString("helperState", ""), p.optBoolean("helperRequested", false))
+    }
+    private fun nextPacket(): ByteArray {
+        val all = packets.values.toList()
+        // Every other slot favors controls; round robin slots keep alerts moving.
+        val index = rotationIndex++ and Int.MAX_VALUE
+        val controls = all.filter { priority(it) < 4 }.sortedBy { priority(it) }
+        val urgent = controls.filter { priority(it) == priority(controls.first()) }
+        return if (index % 2 == 0 && urgent.isNotEmpty()) urgent[(index / 2) % urgent.size] else all[(index / 2) % all.size]
+    }
     private val rotate = object : Runnable {
         override fun run() {
             synchronized(this@MeshEngine) {
                 val now = System.currentTimeMillis()
                 packets.entries.removeAll { expires(it.value) <= now }
-                persistPackets()
+                try { persistPackets() } catch (error: Exception) {
+                    MeshRuntime.listener?.invoke("onError", mapOf("error" to (error.message ?: "Cannot persist BLE queue")))
+                }
                 if (packets.isEmpty()) { stopAdvertising(); return }
-                payload = packets.values.elementAt(rotationIndex++ % packets.size)
+                payload = nextPacket()
             }
             handler.postDelayed(this, 10000)
         }
@@ -161,9 +190,19 @@ internal class MeshEngine(private val context: Context) {
         val objectData = org.json.JSONObject(String(bytes, Charsets.UTF_8))
         return java.time.Instant.parse(objectData.getString("timestamp")).toEpochMilli() + objectData.getLong("ttlSeconds") * 1000
     }
-    private fun persistPackets() { prefs.edit().putString("adverts", JSONArray(packets.values.map { Base64.encodeToString(it, Base64.NO_WRAP) }).toString()).commit() }
-    @Synchronized fun resumeAdvertisements() {
-        if (advertising || starting) return
+    private fun persistPackets() {
+        versions.entries.removeAll { expires(it.value) + 300000 <= System.currentTimeMillis() }
+        check(prefs.edit().putString("adverts", JSONArray(packets.values.map { Base64.encodeToString(it, Base64.NO_WRAP) }).toString())
+            .putString("versions", JSONArray(versions.values.map { Base64.encodeToString(it, Base64.NO_WRAP) }).toString()).commit()) { "Cannot persist BLE queue" }
+    }
+    private fun restorePackets() {
+        val floors = JSONArray(prefs.getString("versions", "[]"))
+        for (index in 0 until floors.length()) {
+            try {
+                val bytes = Base64.decode(floors.getString(index), Base64.DEFAULT)
+                if (expires(bytes) + 300000 > System.currentTimeMillis()) versions[objectData(bytes).getString("sosId")] = bytes
+            } catch (_: Exception) {}
+        }
         val saved = JSONArray(prefs.getString("adverts", "[]"))
         for (index in 0 until saved.length()) {
             try {
@@ -171,7 +210,16 @@ internal class MeshEngine(private val context: Context) {
                 if (expires(bytes) > System.currentTimeMillis()) packets[org.json.JSONObject(String(bytes, Charsets.UTF_8)).getString("sosId")] = bytes
             } catch (_: Exception) {}
         }
-        if (packets.isNotEmpty()) { payload = packets.values.first(); beginAdvertising() }
+    }
+    init { restorePackets() }
+    @Synchronized fun resumeAdvertisements() {
+        if (advertising || starting) return
+        checkBluetooth()
+        packets.entries.removeAll { expires(it.value) <= System.currentTimeMillis() }
+        if (packets.isNotEmpty()) {
+            payload = packets.values.minByOrNull { priority(it) }!!
+            try { beginAdvertising() } catch (error: Exception) { stopRadio(); throw error }
+        }
     }
     @Synchronized fun removeAdvertisement(id: String) {
         packets.remove(id); persistPackets()
@@ -207,10 +255,7 @@ internal class MeshEngine(private val context: Context) {
         if (!adapter.isEnabled) {
             stopScanning()
             if (advertising || starting) {
-                val saved = packets.toMap()
-                stopAdvertising()
-                packets.putAll(saved)
-                persistPackets()
+                stopRadio()
             }
             return
         }
@@ -243,23 +288,34 @@ internal class MeshEngine(private val context: Context) {
     }
     @Synchronized fun advertise(base64: String, promise: Promise) {
         try {
-            checkBluetooth()
             val bytes = Base64.decode(base64, Base64.DEFAULT)
             check(bytes.isNotEmpty() && bytes.size <= MAX_BYTES) { "Packet must contain 1–16384 bytes" }
-            if (pending != null) { promise.reject("BLE_BUSY", "Advertising is starting", null); return }
-            val id = org.json.JSONObject(String(bytes, Charsets.UTF_8)).getString("sosId")
+            val data = objectData(bytes)
+            val id = data.getString("sosId")
             check(expires(bytes) > System.currentTimeMillis()) { "SOS expired" }
             synchronized(this) {
-                check(packets.size < 100 || packets.containsKey(id)) { "Relay advertising queue is full" }
-                if (packets[id]?.contentEquals(bytes) != true) payload = bytes
+                val previous = versions[id] ?: packets[id]
+                if (!PacketPolicy.canReplace(previous?.let { version(it) }, version(bytes))) { promise.resolve(true); return }
+                check(PacketPolicy.hasCapacity(packets.size, packets.containsKey(id), priority(bytes))) { "Relay advertising queue is full" }
+                if (packets[id]?.contentEquals(bytes) != true && (payload.isEmpty() || priority(bytes) <= priority(payload))) payload = bytes
                 packets[id] = bytes
+                versions[id] = bytes
+                // A verified cancellation/request change also retires old consent snapshots.
+                if (data.getString("messageType") in listOf("SOS_CANCEL", "SOS_ALERT")) {
+                    packets.entries.removeAll { (_, stored) ->
+                        val p = objectData(stored)
+                        p.optString("targetSosId") == id && p.optString("messageType") == "SOS_HELPER" &&
+                            (data.getString("messageType") == "SOS_CANCEL" || !data.optBoolean("helperRequested") || p.optString("helperRequestId") != data.optString("helperRequestId"))
+                    }
+                }
                 persistPackets()
             }
-            if (advertising) { promise.resolve(true); return }
-            payload = bytes
+            checkBluetooth()
+            if (advertising || starting) { promise.resolve(true); return }
+            payload = packets.values.minByOrNull { priority(it) }!!
             pending = promise
-            beginAdvertising()
-        } catch (error: Exception) { pending = null; promise.reject("BLE_ADV_ERROR", error.message, error); stopAdvertising() }
+            try { beginAdvertising() } catch (error: Exception) { pending = null; stopRadio(); throw error }
+        } catch (error: Exception) { promise.reject("BLE_ADV_ERROR", error.message, error); scheduleRadioRetry() }
     }
     private fun beginAdvertising() {
         starting = true
@@ -273,8 +329,13 @@ internal class MeshEngine(private val context: Context) {
         handler.postDelayed(advertTimeout, 10000)
     }
     @Synchronized fun stopAdvertising() {
+        packets.clear(); persistPackets()
+        handler.removeCallbacks(retryRadio)
+        stopRadio()
+    }
+    @Synchronized private fun stopRadio() {
         handler.removeCallbacks(rotate)
-        packets.clear(); persistPackets(); starting = false
+        starting = false
         handler.removeCallbacks(advertTimeout)
         advertExpiry?.let { handler.removeCallbacks(it) }; advertExpiry = null
         pending?.reject("BLE_STOPPED", "Advertising stopped", null); pending = null
@@ -284,7 +345,8 @@ internal class MeshEngine(private val context: Context) {
     }
     private fun failAdvertising(message: String) {
         pending?.reject("BLE_ADV_ERROR", message, null); pending = null
-        stopAdvertising()
+        stopRadio()
+        scheduleRadioRetry()
         MeshRuntime.listener?.invoke("onError", mapOf("error" to message))
     }
     private val serverCallback = object : BluetoothGattServerCallback() {
@@ -318,7 +380,7 @@ internal class MeshEngine(private val context: Context) {
         }
     }
     private val advertCallback = object : AdvertiseCallback() {
-        override fun onStartSuccess(settings: AdvertiseSettings) { handler.removeCallbacks(advertTimeout); advertising=true; starting=false; pending?.resolve(true); pending=null; handler.removeCallbacks(rotate); handler.post(rotate) }
+        override fun onStartSuccess(settings: AdvertiseSettings) { handler.removeCallbacks(advertTimeout); handler.removeCallbacks(retryRadio); retryDelay=1000L; advertising=true; starting=false; pending?.resolve(true); pending=null; handler.removeCallbacks(rotate); handler.postDelayed(rotate, 10000) }
         override fun onStartFailure(code: Int) { failAdvertising("Advertising failed: $code") }
     }
     private val scanCallback = object : ScanCallback() {

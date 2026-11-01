@@ -251,6 +251,7 @@ internal class MeshEngine(private val context: Context) {
             check(expires(bytes) > System.currentTimeMillis()) { "SOS expired" }
             synchronized(this) {
                 check(packets.size < 100 || packets.containsKey(id)) { "Relay advertising queue is full" }
+                if (packets[id]?.contentEquals(bytes) != true) payload = bytes
                 packets[id] = bytes
                 persistPackets()
             }

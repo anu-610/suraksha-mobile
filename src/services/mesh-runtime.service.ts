@@ -94,7 +94,7 @@ async function receiveMeshInbox(): Promise<void> {
         pending = pending.filter(p => p.sosId !== payload.sosId || p.messageType === SOSMessageType.SOS_CANCEL);
         offers = offers.filter(p => p.targetSosId !== payload.sosId);
         await AsyncStorage.setItem(TOMBSTONES, JSON.stringify(cancelled));
-        if (!tombstone) await bleMeshInstance.stopAdvertising(payload.sosId).catch(() => undefined);
+        if (!tombstone && payload.hopCount >= payload.maxHops) await bleMeshInstance.stopAdvertising(payload.sosId).catch(() => undefined);
         await Notifications.dismissNotificationAsync(`sos-${payload.sosId}`).catch(() => undefined);
       } else if (helper) {
         if (payload.targetDeviceId === deviceId) {
@@ -108,7 +108,13 @@ async function receiveMeshInbox(): Promise<void> {
         const event = { ...payload, distanceMeters };
         events = [...events.filter(p => p.sosId !== payload.sosId).slice(-199), event];
         bleMeshInstance.reportReceived(event);
-        if (!previous) await notify(event).catch(() => undefined);
+        if (payload.helperRequested && !previous?.helperRequested) {
+          const hidden = await list<{ id: string; until: number }>(DISMISSED);
+          await AsyncStorage.setItem(DISMISSED, JSON.stringify(hidden.filter(p => p.id !== payload.sosId)));
+          await Notifications.scheduleNotificationAsync({ identifier: `helper-${payload.sosId}`,
+            content: { title: 'Location sharing request', body: `${payload.userName} asks to approach an online helper. Open Suraksha to agree or decline.` },
+            trigger: null }).catch(() => undefined);
+        } else if (!previous) await notify(event).catch(() => undefined);
       } else if ((payload.revision ?? 0) < (previous.revision ?? 0)) {
         await Peripheral.acknowledgeInbox(packet); continue;
       }
@@ -120,7 +126,7 @@ async function receiveMeshInbox(): Promise<void> {
       await AsyncStorage.setItem(NEARBY, JSON.stringify(events));
       await AsyncStorage.setItem(OFFERS, JSON.stringify(offers));
       await AsyncStorage.setItem(RELAYS, JSON.stringify(pending));
-      if (cancellation && payload.hopCount < payload.maxHops)
+      if ((cancellation || helper || payload.helperRequested) && payload.hopCount < payload.maxHops)
         await bleMeshInstance.startAdvertising(bleMeshInstance.prepareRelay(payload, deviceId)).catch(() => undefined);
       await Peripheral.acknowledgeInbox(packet);
     }
@@ -156,7 +162,7 @@ export async function shareHelperLocation(event: SOSPayload): Promise<void> {
 // storage updates share the inbox lock; the single upload pump reconciles IDs.
 export async function processMeshWork(): Promise<void> {
   await receiveMeshInbox();
-  await SOSTriggerService.updateActiveLocations();
+  void SOSTriggerService.updateActiveLocations().catch(() => undefined);
   if (!forwarding) forwarding = forwardPending().finally(() => { forwarding = undefined; });
   await forwarding;
 }

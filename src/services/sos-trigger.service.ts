@@ -110,16 +110,10 @@ export class SOSTriggerService {
       await AsyncStorage.setItem(CANCEL_KEY, JSON.stringify([...pending.filter(item => item.sosId !== sosId), cancellation]));
       await this.remove(sosId);
     });
-    await bleMeshInstance.stopAdvertising(sosId).catch(() => undefined);
-    await this.broadcastCancellations();
-    try {
-      await SOSApiService.cancelSOS(cancellation);
-      await this.exclusive(async () => {
-        const latest = await this.read<SOSCancellation>(CANCEL_KEY);
-        await AsyncStorage.setItem(CANCEL_KEY, JSON.stringify(latest.filter(item => item.sosId !== sosId)));
-      });
-      return true;
-    } catch { return false; }
+    // Local cancellation is durable. Radio and HTTP completion must not hold the UI.
+    void this.broadcastCancellations().catch(() => undefined);
+    void this.retryPendingQueue().catch(() => undefined);
+    return false; // Server confirmation is pending, never imply BLE delivery was acknowledged.
   }
   public static async activeSOS(): Promise<SOSPayload[]> {
     const cancelled = await this.read<SOSPayload>(CANCEL_PACKETS);
@@ -130,10 +124,16 @@ export class SOSTriggerService {
       const active = await this.read<SOSPayload>(ACTIVE_KEY);
       const item = active.find(p => p.sosId === sosId && isLivePayload(p));
       if (!item) throw new Error('SOS is no longer active');
-      item.helperRequested = true;
-      await AsyncStorage.setItem(ACTIVE_KEY, JSON.stringify(active));
+      const next: SOSPayload = { ...item, helperRequested: true, protocolVersion: 2,
+        revision: (item.revision ?? 0) + 1, hopCount: 0, relayChain: [] };
+      next.originProof = await signOrigin(next, false);
+      await AsyncStorage.setItem(ACTIVE_KEY, JSON.stringify(active.map(p => p.sosId === sosId ? next : p)));
+      const queue = await this.read<SOSPayload>(QUEUE_KEY);
+      await AsyncStorage.setItem(QUEUE_KEY, JSON.stringify([...queue.filter(p => p.sosId !== sosId), next]));
     });
-    await this.updateActiveLocations(undefined, true);
+    // Requesting permission does not need a new GPS fix or an HTTP round trip.
+    const source = (await this.activeSOS()).find(p => p.sosId === sosId);
+    if (source) await bleMeshInstance.startAdvertising(source);
   }
   private static updating: Promise<void> | undefined;
   public static updateActiveLocations(fix?: SOSLocation, force = false): Promise<void> {
@@ -173,6 +173,7 @@ export class SOSTriggerService {
     return this.retrying;
   }
   private static async flushQueue(): Promise<void> {
+    await this.broadcastCancellations();
     const { isOnline } = await NetworkService.checkConnectivity().catch(() => ({ isOnline: false }));
     // A crash after persisting the signed cancel but before pruning the alert must never revive it.
     await this.exclusive(async () => {
@@ -191,7 +192,7 @@ export class SOSTriggerService {
     const cancellations = await this.exclusive(() => this.read<SOSCancellation>(CANCEL_KEY));
     for (const cancellation of cancellations) {
       await this.exclusive(() => this.remove(cancellation.sosId));
-      await bleMeshInstance.stopAdvertising(cancellation.sosId).catch(() => undefined);
+      // Keep the cancellation on air while its API retry is pending.
       if (isOnline) {
         try {
           await SOSApiService.cancelSOS(cancellation);

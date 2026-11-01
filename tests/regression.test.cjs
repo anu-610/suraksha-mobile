@@ -269,7 +269,7 @@ test('cancelling a queued SOS does not wait for an in-flight upload', async () =
   let began; const started=new Promise(resolve=>{began=resolve;});
   h.setBlockSend(async()=>{began();await blocked;}); h.setOnline(true);
   const retry=h.service.retryPendingQueue();await started;
-  assert.equal(await h.service.cancelSOS(event.sosId,'owner'),true);
+  assert.equal(await h.service.cancelSOS(event.sosId,'owner'),false);
   assert.equal(h.store.get('@suraksha_sos_queue'),'[]');
   release();await retry;
   assert.equal(h.store.get('@suraksha_sos_queue'),'[]');
@@ -438,4 +438,17 @@ test('a durable signed cancellation wins after a crash before alert cleanup', as
   assert.equal((await h.service.activeSOS()).length,0);
   h.setOnline(true);await h.service.retryPendingQueue();
   assert.equal(h.sent.length,0);assert.equal(h.store.get('@suraksha_sos_queue'),'[]');
+});
+
+
+test('helper request signs and queues immediately without requesting GPS again', async () => {
+  const h = queueHarness(); h.setAdvertise(true);
+  const event = await h.service.triggerSOS(params);
+  const before = h.locationCalls(); h.setFailLocation(true);
+  await h.service.requestHelper(event.sosId);
+  const next = (await h.service.activeSOS())[0];
+  assert.equal(h.locationCalls(), before);
+  assert.equal(next.helperRequested, true); assert.equal(next.revision, 1);
+  assert.ok(next.originProof);
+  assert.equal(JSON.parse(h.store.get('@suraksha_sos_queue'))[0].helperRequested, true);
 });

@@ -309,6 +309,38 @@ test('an unverifiable server receipt still completes the relay upload and the ne
   assert.equal(sent.length,2); // marked forwarded, not re-uploaded forever
 });
 
+test('Bluetooth off asks once, never loops on resume, and still queues the SOS', async () => {
+  let dialogs=0;let on=false;const ads=[];
+  const peripheral={isBluetoothEnabled:async()=>on,requestEnableBluetooth:async()=>{dialogs++;await new Promise(r=>setTimeout(r,5));return false;},
+    initialize:async()=>true,onSOSReceived:()=>null,onError:()=>null,startAdvertising:async p=>{ads.push(p);return true;}};
+  const rn={Platform:{OS:'android',Version:34},PermissionsAndroid:{PERMISSIONS:{BLUETOOTH_CONNECT:'c',BLUETOOTH_ADVERTISE:'a',BLUETOOTH_SCAN:'s',ACCESS_FINE_LOCATION:'l'},
+    RESULTS:{GRANTED:'granted'},request:async()=>'granted',check:async()=>true,requestMultiple:async list=>Object.fromEntries(list.map(p=>[p,p==='l'?'denied':'granted']))}};
+  const load=loader({'react-native':rn,'../../modules/ble-peripheral':peripheral});
+  const mesh=new (load('src/services/ble-mesh.service.ts').BLEMeshService)();
+  await mesh.requestPermissions(); // Android 12+: location optional for relay
+  assert.deepEqual(await Promise.all([mesh.ensureBluetoothOn(),mesh.ensureBluetoothOn()]),[false,false]);
+  assert.equal(dialogs,1);
+  mesh.askOnOpen(); assert.equal(dialogs,1); // the resume right after our own dialog
+  assert.equal(await mesh.nearbyProblem(),'bluetooth');
+  on=true; assert.equal(await mesh.ensureBluetoothOn(),true); assert.equal(dialogs,1);
+  assert.equal(await mesh.nearbyProblem(),null);
+  const store=new Map();on=false;
+  const service=loader({
+    '@react-native-async-storage/async-storage':{getItem:async k=>store.get(k)??null,setItem:async(k,v)=>store.set(k,v)},
+    './location.service':{LocationService:{availableLocation:()=>null,getCurrentLocation:async()=>{throw Error('No GPS');}}},
+    './origin-security':{signOrigin:async()=>({})},
+    './network.service':{NetworkService:{checkConnectivity:async()=>({isOnline:false})}},
+    './sos-api.service':{ApiError:class extends Error {},SOSApiService:{setAuthToken(){}}},
+    './ble-mesh.service':{BLEMeshService:class {async requestPermissions(){} async startAdvertising(p){ads.push(p);} async ensureBluetoothOn(){asked++;return false;}}},
+  })('src/services/sos-trigger.service.ts').SOSTriggerService;
+  let asked=0;
+  const sos=await service.triggerSOS(params);
+  await new Promise(r=>setTimeout(r,20));
+  assert.ok(ads.some(p=>p.sosId===sos.sosId)); // handed to native queue anyway
+  assert.equal(asked,1);
+  mesh.askOnOpen(); await new Promise(r=>setTimeout(r,20)); assert.equal(dialogs,1); // Bluetooth was on by then
+});
+
 test('an unverifiable server receipt does not keep the sender SOS queued forever', async () => {
   const store=new Map();let uploads=0;
   const service=loader({

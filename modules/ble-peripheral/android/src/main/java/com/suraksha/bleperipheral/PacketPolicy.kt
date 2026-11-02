@@ -40,4 +40,17 @@ internal object PacketPolicy {
     // our per-device cursor) survived.
     const val TRANSFER_GAP_MS = 2000L
     fun transferIsLive(lastRead: Long?, now: Long): Boolean = lastRead != null && now - lastRead <= TRANSFER_GAP_MS
+
+    // Which packet a reader gets next. `hashes` are queued packets in priority
+    // order, `seen` what this reader already read. Unread packets go first, so a
+    // new SOS reaches a phone on its next read even while an old cancellation
+    // keeps advertising for its whole TTL. When all are read, a new round starts.
+    fun nextForReader(hashes: List<Int>, seen: MutableSet<Int>): Int {
+        if (hashes.isEmpty()) return -1
+        seen.retainAll(hashes.toSet())
+        val fresh = hashes.indexOfFirst { it !in seen }
+        if (fresh >= 0) return fresh
+        seen.clear()
+        return 0
+    }
 }

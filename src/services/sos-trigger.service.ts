@@ -42,6 +42,14 @@ export class SOSTriggerService {
   private static broadcast(payload: SOSPayload) {
     void bleMeshInstance.startAdvertising(payload).catch(() => undefined);
   }
+  // Bluetooth off used to fail silently. Now the SOS is queued natively anyway (it
+  // goes out once Bluetooth is on) and the user is asked to turn it on; the
+  // BluetoothBanner keeps showing the problem until it is fixed.
+  private static async startNearby(payload: SOSPayload) {
+    await bleMeshInstance.requestPermissions(true);
+    this.broadcast(payload);
+    await bleMeshInstance.ensureBluetoothOn();
+  }
   public static async triggerSOS(params: { userId: string; userName: string; userPhone: string;
     authToken?: string; sosType: SOSType; message?: string }): Promise<SOSPayload> {
     if (!params.userId.trim() || !params.userName.trim()) throw new Error('Sign in before sending an SOS.');
@@ -63,7 +71,7 @@ export class SOSTriggerService {
       await AsyncStorage.setItem(QUEUE_KEY, JSON.stringify([...queue, payload]));
     });
     await recordSaved(payload);
-    void bleMeshInstance.requestPermissions(true).then(() => this.broadcast(payload)).catch(() => undefined);
+    void this.startNearby(payload).catch(() => undefined);
     void this.retryPendingQueue().catch(() => undefined);
     // Sending and fresh GPS run independently. Failure to get a fix never delays
     // the first packet; a successful fix produces a signed higher revision.

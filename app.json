@@ -63,6 +63,7 @@
         }
       ],
       "expo-secure-store",
+      "./plugins/with-ble-scan-never-for-location",
       "expo-background-task"
     ],
     "experiments": {

@@ -15,6 +15,7 @@ import com.facebook.react.jstasks.HeadlessJsTaskConfig
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 import expo.modules.kotlin.Promise
+import expo.modules.kotlin.functions.Queues
 import org.json.JSONArray
 import java.io.ByteArrayOutputStream
 import java.util.UUID
@@ -37,7 +38,27 @@ class BlePeripheralModule : Module() {
         OnActivityEntersForeground { MeshRuntime.engine?.setForeground(true) }
         OnActivityEntersBackground { MeshRuntime.engine?.setForeground(false) }
         OnDestroy { MeshRuntime.listener = null } // The service deliberately survives React teardown.
-        AsyncFunction("initialize") { MeshRuntime.get(requireContext()).checkBluetooth(); true }
+        // No Bluetooth check here: with the radio off the SOS must still be queued,
+        // so it goes out as soon as Bluetooth is turned on.
+        AsyncFunction("initialize") { MeshRuntime.get(requireContext()); true }
+        AsyncFunction("isBluetoothEnabled") {
+            (requireContext().getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter?.isEnabled == true
+        }
+        // System "Allow Suraksha to turn on Bluetooth?" dialog. Needs BLUETOOTH_CONNECT on Android 12+.
+        AsyncFunction("requestEnableBluetooth") { promise: Promise ->
+            val adapter = (requireContext().getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
+            val activity = appContext.currentActivity
+            if (adapter == null || activity == null) { promise.resolve(false); return@AsyncFunction }
+            if (adapter.isEnabled) { promise.resolve(true); return@AsyncFunction }
+            enablePromise?.resolve(false)
+            enablePromise = promise
+            try { activity.startActivityForResult(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE), ENABLE_BLUETOOTH) }
+            catch (error: Exception) { enablePromise = null; promise.reject("BLE_ENABLE", error.message ?: "Cannot ask to turn on Bluetooth", error) }
+        }.runOnQueue(Queues.MAIN)
+        OnActivityResult { _, result ->
+            if (result.requestCode != ENABLE_BLUETOOTH) return@OnActivityResult
+            enablePromise?.resolve(result.resultCode == Activity.RESULT_OK); enablePromise = null
+        }
         AsyncFunction("startAdvertising") { payload: String, promise: Promise ->
             MeshRuntime.get(requireContext()).advertise(payload, promise)
         }
@@ -73,6 +94,8 @@ class BlePeripheralModule : Module() {
         }
     }
     private fun requireContext(): Context = appContext.reactContext ?: throw IllegalStateException("React context unavailable")
+    private var enablePromise: Promise? = null
+    private companion object { const val ENABLE_BLUETOOTH = 7311 }
 }
 
 /** Android 14+ connectedDevice foreground service. Start only from explicit foreground opt-in. */
@@ -250,6 +273,7 @@ internal class MeshEngine(private val context: Context) {
     private val chunkSizes = ConcurrentHashMap<String, Int>()
     private val lastSeen = ConcurrentHashMap<String, Long>()
     private val lastReads = ConcurrentHashMap<String, Long>()
+    private val served = ConcurrentHashMap<String, MutableSet<Int>>()
     private var advertExpiry: Runnable? = null
     private val advertTimeout = Runnable { failAdvertising("Advertising timed out") }
     fun checkBluetooth() { check(adapter?.isEnabled == true) { "Enable Bluetooth to use nearby relay" } }
@@ -327,7 +351,9 @@ internal class MeshEngine(private val context: Context) {
     }
     @Synchronized fun startScanning() {
         scanWanted = true
-        checkBluetooth()
+        // Relay stays enabled while Bluetooth is off; the state receiver starts the
+        // scan when it comes on. The app shows a "Bluetooth is off" banner meanwhile.
+        if (!adapter.isEnabled) return
         if (scanning) return
         val now = System.currentTimeMillis()
         val wait = PacketPolicy.scanStartDelay(scanStarts.toList(), now)
@@ -436,7 +462,7 @@ internal class MeshEngine(private val context: Context) {
             if (!PacketPolicy.transferIsLive(lastReads[device.address], now)) endTransfer(device.address)
             if (snapshots.size >= 8 && !snapshots.containsKey(device.address)) { server?.sendResponse(device,requestId,BluetoothGatt.GATT_FAILURE,0,null); return }
             lastReads[device.address] = now
-            val snapshot = snapshots.getOrPut(device.address) { payload.copyOf() }
+            val snapshot = snapshots.getOrPut(device.address) { packetFor(device.address) }
             val seq = cursors[device.address] ?: 0
             val chunkSize = chunkSizes.getOrPut(device.address) {
                 if (characteristic.uuid == FAST_DATA) minOf(180, maxOf(12, (mtus[device.address] ?: 23) - 11)) else 12
@@ -448,8 +474,20 @@ internal class MeshEngine(private val context: Context) {
             // Freeze chunk size per connection so sequence offsets stay consistent.
             val frame = byteArrayOf(83,75,2,(seq shr 8).toByte(),seq.toByte(),(total shr 8).toByte(),total.toByte(),chunk.size.toByte()) + chunk
             server?.sendResponse(device,requestId,BluetoothGatt.GATT_SUCCESS,0,frame)
-            if (seq + 1 >= total) endTransfer(device.address) else cursors[device.address] = seq + 1
+            if (seq + 1 >= total) {
+                served.getOrPut(device.address) { mutableSetOf() }.add(snapshot.contentHashCode())
+                endTransfer(device.address)
+            } else cursors[device.address] = seq + 1
         }
+    }
+    // Per reader, not one 10 s slot for everyone: the old shared rotation gave a
+    // new SOS 1 slot in 4 (1 in 6 with two cancellations) after a cancel.
+    @Synchronized private fun packetFor(reader: String): ByteArray {
+        val all = packets.values.sortedBy { priority(it) }
+        if (all.isEmpty()) return payload.copyOf()
+        if (served.size > 200) served.clear()
+        val index = PacketPolicy.nextForReader(all.map { it.contentHashCode() }, served.getOrPut(reader) { mutableSetOf() })
+        return all[index].copyOf()
     }
     private fun endTransfer(address: String) {
         cursors.remove(address); snapshots.remove(address); chunkSizes.remove(address); lastReads.remove(address)

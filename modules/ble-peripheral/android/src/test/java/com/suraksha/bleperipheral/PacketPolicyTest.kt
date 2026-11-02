@@ -41,6 +41,16 @@ class PacketPolicyTest {
         // Starts older than the window no longer count.
         assertEquals(0, PacketPolicy.scanStartDelay(listOf(1000L, 2000L, 3000L, 4000L), 40000L))
     }
+    @Test fun newSosAfterCancellationIsServedOnNextRead() {
+        val cancel = 11; val second = 22
+        val seen = mutableSetOf(cancel) // reader already has the old cancellation
+        assertEquals(1, PacketPolicy.nextForReader(listOf(cancel, second), seen))
+        seen.add(second)
+        // Everything read: new round, still every packet in turn.
+        assertEquals(0, PacketPolicy.nextForReader(listOf(cancel, second), seen)); seen.add(cancel)
+        assertEquals(1, PacketPolicy.nextForReader(listOf(cancel, second), seen))
+        assertEquals(-1, PacketPolicy.nextForReader(emptyList(), mutableSetOf()))
+    }
     @Test fun reconnectAfterGapRestartsServerTransfer() {
         assertFalse(PacketPolicy.transferIsLive(null, 5000L))
         assertTrue(PacketPolicy.transferIsLive(4900L, 5000L))

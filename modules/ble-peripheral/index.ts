@@ -44,6 +44,8 @@ declare class BlePeripheralNativeModule extends NativeModule<BleEvents> {
   removeAdvertisement(id: string): Promise<void>;
   getInbox(): Promise<string[]>;
   acknowledgeInbox(packet: string): Promise<void>;
+  isBluetoothEnabled?(): Promise<boolean>;
+  requestEnableBluetooth?(): Promise<boolean>;
 }
 
 // ── Load Native Module ──────────────────────────────────────────
@@ -166,3 +168,12 @@ export async function getInbox(): Promise<string[]> { return nativeModule ? nati
 export async function acknowledgeInbox(packet: string): Promise<void> { await nativeModule?.acknowledgeInbox(packet); }
 
 export async function removeAdvertisement(id: string): Promise<void> { await nativeModule?.removeAdvertisement(id); }
+
+// Android only; other platforms report Bluetooth as available.
+export async function isBluetoothEnabled(): Promise<boolean> {
+  return nativeModule?.isBluetoothEnabled ? nativeModule.isBluetoothEnabled() : true;
+}
+/** Shows the system "turn on Bluetooth" dialog. Resolves true when Bluetooth is on. */
+export async function requestEnableBluetooth(): Promise<boolean> {
+  return nativeModule?.requestEnableBluetooth ? nativeModule.requestEnableBluetooth() : true;
+}

@@ -22,6 +22,7 @@ import { Session, loadSession, signOut } from '../services/session.service';
 import { startSOSTracking, stopSOSTracking } from '../services/sos-tracking.service';
 import { setRelayEnabled, isRelayEnabled, helperOffers, helperResponseState } from '../services/mesh-runtime.service';
 import { HelperConsentCard } from '../components/HelperConsentCard';
+import { BluetoothBanner } from '../components/BluetoothBanner';
 import { locationDescription } from '../services/location.service';
 import { deliveryStates, deliveryLabel } from '../services/delivery.service';
 import { requestExpiry, requestIsOpen } from '../services/mesh-policy';
@@ -190,6 +191,7 @@ export default function Index() {
       <ScrollView contentContainerStyle={{ flexGrow: 1 }} keyboardShouldPersistTaps="handled">
       <Text style={styles.title}>🛡️ Suraksha</Text>
       <Text style={styles.subtitle}>Emergency Response Network</Text>
+      <BluetoothBanner />
       <BackendSettings onSaved={() => setSettingsVersion(value => value + 1)} />
       {!session ? <AuthPanel key={settingsVersion} onSession={setSession} /> : <View style={{ padding: 16 }}>
         <Text style={styles.statusText}>Signed in as {session.user.name}</Text>

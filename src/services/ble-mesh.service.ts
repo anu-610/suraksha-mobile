@@ -69,16 +69,46 @@ export class BLEMeshService {
     for (const p of this.latest.values()) if (p.messageType === 'SOS_HELPER' && p.targetSosId === sosId) await Peripheral.removeAdvertisement(p.sosId);
   }
   public reportReceived(payload: SOSPayload) { this.emit('onSOSReceived', payload); }
+  public async isBluetoothOn(): Promise<boolean> {
+    return Platform.OS !== 'android' || await Peripheral.isBluetoothEnabled().catch(() => true);
+  }
+  /** What stops nearby SOS right now, for the on-screen banner; null when fine. */
+  public async nearbyProblem(): Promise<'permission' | 'bluetooth' | null> {
+    if (Platform.OS !== 'android') return null;
+    if (Number(Platform.Version) >= 31 && !await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE).catch(() => true)) return 'permission';
+    return await this.isBluetoothOn() ? null : 'bluetooth';
+  }
+  private enabling: Promise<boolean> | null = null;
+  private promptEnded = 0;
+  /** On app open/resume. Skips the resume caused by our own dialog, or a "No" would loop. */
+  public askOnOpen(): void {
+    if (this.enabling || Date.now() - this.promptEnded < 3000) return;
+    void this.ensureBluetoothOn();
+  }
+  /** Asks to turn Bluetooth on if it is off. One dialog at a time; false if the user says no. */
+  public ensureBluetoothOn(): Promise<boolean> {
+    return this.enabling ??= (async () => {
+      if (await this.isBluetoothOn()) return true;
+      // Android 12+ needs Nearby devices permission before it can show the dialog.
+      if (Number(Platform.Version) >= 31 && await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT) !== PermissionsAndroid.RESULTS.GRANTED) return false;
+      return Peripheral.requestEnableBluetooth();
+    })().catch(() => false).finally(() => { this.enabling = null; this.promptEnded = Date.now(); });
+  }
   public async requestPermissions(advertiseOnly = false): Promise<void> {
     if (Platform.OS === 'android') {
-      const permissions = Number(Platform.Version) >= 31
+      const modern = Number(Platform.Version) >= 31;
+      // Android 12+ scans are declared neverForLocation, so location is only
+      // asked for (distance display), not required. Android 11 and older need it.
+      const required = modern
         ? advertiseOnly
           ? [PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT, PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE]
           : [PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN, PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
-            PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE, PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION]
+            PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE]
         : advertiseOnly ? [] : [PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION];
+      const permissions = modern && !advertiseOnly ? [...required, PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION] : required;
       const result = await PermissionsAndroid.requestMultiple(permissions);
-      if (permissions.some(permission => result[permission] !== PermissionsAndroid.RESULTS.GRANTED)) throw new Error('Nearby relay requires Bluetooth and location permissions.');
+      if (required.some(permission => result[permission] !== PermissionsAndroid.RESULTS.GRANTED))
+        throw new Error(modern ? 'Allow Nearby devices permission for Bluetooth SOS.' : 'Nearby relay requires Bluetooth and location permissions.');
     }
   }
   public async startScanning(): Promise<void> {

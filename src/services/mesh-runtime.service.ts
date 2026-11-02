@@ -229,6 +229,11 @@ export async function setRelayEnabled(enabled: boolean): Promise<void> {
     await bleMeshInstance.requestPermissions();
     const permission = await Location.requestForegroundPermissionsAsync();
     if (permission.granted) void Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }).catch(() => undefined);
+    // Relay starts even if this is declined; scanning begins when Bluetooth comes on.
+    await bleMeshInstance.ensureBluetoothOn();
+    // Android 11 and older return no BLE scan results while the Location switch is off.
+    if (Platform.OS === 'android' && Number(Platform.Version) < 31 && !(await Location.hasServicesEnabledAsync().catch(() => true)))
+      await Location.enableNetworkProviderAsync().catch(() => undefined);
     if (Platform.OS !== 'web') {
       if (Platform.OS === 'android') await Notifications.setNotificationChannelAsync('sos-alerts', { name: 'Nearby SOS alerts', importance: Notifications.AndroidImportance.HIGH });
       await Notifications.requestPermissionsAsync();

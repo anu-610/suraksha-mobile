@@ -24,4 +24,20 @@ internal object PacketPolicy {
         else -> 4
     }
     fun hasCapacity(size: Int, existing: Boolean, priority: Int): Boolean = existing || size < if (priority < 4) 132 else 100
+
+    // Android allows 5 scan starts per 30 s per app. Past that, older versions
+    // drop the scan without any callback, so we stay one below and wait instead.
+    const val SCAN_START_LIMIT = 4
+    const val SCAN_START_WINDOW_MS = 30000L
+    fun scanStartDelay(recentStarts: List<Long>, now: Long): Long {
+        val inWindow = recentStarts.filter { now - it < SCAN_START_WINDOW_MS }.sorted()
+        if (inWindow.size < SCAN_START_LIMIT) return 0
+        return inWindow[inWindow.size - SCAN_START_LIMIT] + SCAN_START_WINDOW_MS - now + 500
+    }
+
+    // Reads inside one GATT transfer come back to back. A longer gap means the
+    // reader reconnected and expects frame 0 again, even if the LE link (and so
+    // our per-device cursor) survived.
+    const val TRANSFER_GAP_MS = 2000L
+    fun transferIsLive(lastRead: Long?, now: Long): Boolean = lastRead != null && now - lastRead <= TRANSFER_GAP_MS
 }

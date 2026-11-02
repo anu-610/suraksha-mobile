@@ -77,84 +77,93 @@ async function receiveInbox(): Promise<void> {
   if (!session) return;
   const deviceId = await SOSTriggerService.getDeviceId();
   const selfLocation = await cachedLocation();
+  let failure: unknown;
   for (const encoded of await Peripheral.getInbox()) {
-    let payload: SOSPayload;
-    try { payload = decodePayload(encoded); await verifyOrigin(payload); }
-    catch { await Peripheral.acknowledgeInbox(encoded); continue; }
-    if (payload.originDeviceId === deviceId || payload.relayChain.some(p => p.deviceId === deviceId)) {
-      await Peripheral.acknowledgeInbox(encoded); continue;
-    }
-    let packet: SOSPayload | undefined;
-    let eventToNotify: ActiveSOSEvent | undefined;
-    let helperNotice = false;
-    let retired: string | undefined;
-    let accepted = false;
-    const own = payload.messageType === SOSMessageType.SOS_HELPER && payload.targetDeviceId === deviceId ? await SOSTriggerService.activeSOS() : [];
-    await serial(async () => {
-      const cancelled = (await list<Tombstone>(KEYS.tombstones)).filter(p => p.until > Date.now());
-      if (payload.messageType !== SOSMessageType.SOS_CANCEL && cancelled.some(p =>
-          p.id === payload.sosId && p.owner === payload.userId || payload.messageType === SOSMessageType.SOS_HELPER && p.id === payload.targetSosId)) return;
-      const events = (await list<ActiveSOSEvent>(KEYS.nearby)).filter(isLivePayload);
-      const previous = events.find(p => p.sosId === payload.sosId);
-      if (previous && previous.userId !== payload.userId) return;
-      if (payload.messageType === SOSMessageType.SOS_CANCEL) {
-        retired = payload.sosId;
-        await markCancelled(payload.sosId, payload.userId, expiresAt(payload) + 300000);
-      } else if (payload.messageType === SOSMessageType.SOS_ACK) {
-        if (payload.receiptKind === 'server' && payload.receiptStatus === 'cancelled' && payload.receiptUserId) {
-          retired = payload.targetSosId;
-          await markCancelled(payload.targetSosId!, payload.receiptUserId, expiresAt(payload) + 300000);
-        }
-      } else if (payload.messageType === SOSMessageType.SOS_HELPER) {
-        const target = events.find(p => p.sosId === payload.targetSosId);
-        if (target && (!requestIsOpen(target) || requestId(target) !== requestId(payload))) return;
-        if (payload.targetDeviceId === deviceId) {
-          if (!own.some(p => p.sosId === payload.targetSosId && requestIsOpen(p) && requestId(p) === requestId(payload))) return;
-          const offers = await list<SOSPayload>(KEYS.offers);
-          if (!canReplace(offers.find(p => p.sosId === payload.sosId), payload)) return;
-          await AsyncStorage.setItem(KEYS.offers, JSON.stringify([...offers.filter(p => p.sosId !== payload.sosId && expiresAt(p) + 3600000 > Date.now()), payload].slice(-100)));
-        }
-      } else {
-        if (previous && (payload.revision ?? 0) < (previous.revision ?? 0)) return;
-        if (!previous || (payload.revision ?? 0) > (previous.revision ?? 0)) {
-          const location = latestLocation(previous?.location ?? null, payload.location);
-          const distanceMeters = selfLocation && location ? bleMeshInstance.calculateDistance(selfLocation.latitude, selfLocation.longitude,
-            location.latitude, location.longitude) : undefined;
-          // This is the display snapshot only. Forward the untouched signed packet.
-          const event = { ...payload, location, distanceMeters };
-          await AsyncStorage.setItem(KEYS.nearby, JSON.stringify([...events.filter(p => p.sosId !== payload.sosId).slice(-199), event]));
-          helperNotice = requestIsOpen(payload) && (!previous || !requestIsOpen(previous) || requestId(previous) !== requestId(payload));
-          if (helperNotice) {
-            const hidden = await list<{ id: string; until: number }>(KEYS.dismissed);
-            await AsyncStorage.setItem(KEYS.dismissed, JSON.stringify(hidden.filter(p => p.id !== payload.sosId)));
-          }
-          if (helperNotice || !previous) eventToNotify = event;
-          // A new request/withdrawal cannot leave an old helper snapshot queued.
-          if (!requestIsOpen(payload) || previous && requestId(previous) !== requestId(payload)) {
-            await AsyncStorage.setItem(KEYS.relays, JSON.stringify((await list<SOSPayload>(KEYS.relays)).filter(p =>
-              !(p.messageType === SOSMessageType.SOS_HELPER && p.targetSosId === payload.sosId &&
-                (!requestIsOpen(payload) || requestId(p) !== requestId(payload))))));
-          }
-        }
-      }
-      accepted = true;
-      // Hop limits stop further radio forwarding, not the final internet upload.
-      if (payload.hopCount < payload.maxHops || [SOSMessageType.SOS_ALERT, SOSMessageType.SOS_CANCEL].includes(payload.messageType)) {
-        const candidate = bleMeshInstance.prepareRelay(payload, deviceId);
-        if (await enqueue(candidate)) packet = candidate;
-      }
-    });
-    if (retired) {
-      // The cancellation packet itself remains eligible to advertise.
-      await bleMeshInstance.retireSOS(retired, payload.messageType === SOSMessageType.SOS_CANCEL && payload.hopCount < payload.maxHops).catch(() => undefined);
-      await Promise.all(['sos', 'helper'].map(prefix => Notifications.dismissNotificationAsync(`${prefix}-${retired}`).catch(() => undefined)));
-    }
-    if (accepted && payload.messageType === SOSMessageType.SOS_ACK) await SOSTriggerService.acceptReceipt(payload);
-    if (packet) broadcast(packet);
-    if (eventToNotify) { bleMeshInstance.reportReceived(eventToNotify); await notify(eventToNotify, helperNotice).catch(() => undefined); }
-    if (accepted) await queuePeerReceipt(payload, deviceId, session.user.user_id, session.user.name).catch(() => undefined);
-    await Peripheral.acknowledgeInbox(encoded); // Durable writes always precede native ACK.
+    // One packet that hits a storage or native error stays in the native inbox
+    // for the next tick; it must not hold back the packets behind it.
+    try { await receivePacket(encoded, deviceId, session, selfLocation); }
+    catch (error) { failure ??= error; }
   }
+  if (failure) throw failure;
+}
+async function receivePacket(encoded: string, deviceId: string, session: NonNullable<Awaited<ReturnType<typeof loadSession>>>,
+    selfLocation: SOSLocation | undefined): Promise<void> {
+  let payload: SOSPayload;
+  try { payload = decodePayload(encoded); await verifyOrigin(payload); }
+  catch { await Peripheral.acknowledgeInbox(encoded); return; }
+  if (payload.originDeviceId === deviceId || payload.relayChain.some(p => p.deviceId === deviceId)) {
+    await Peripheral.acknowledgeInbox(encoded); return;
+  }
+  let packet: SOSPayload | undefined;
+  let eventToNotify: ActiveSOSEvent | undefined;
+  let helperNotice = false;
+  let retired: string | undefined;
+  let accepted = false;
+  const own = payload.messageType === SOSMessageType.SOS_HELPER && payload.targetDeviceId === deviceId ? await SOSTriggerService.activeSOS() : [];
+  await serial(async () => {
+    const cancelled = (await list<Tombstone>(KEYS.tombstones)).filter(p => p.until > Date.now());
+    if (payload.messageType !== SOSMessageType.SOS_CANCEL && cancelled.some(p =>
+        p.id === payload.sosId && p.owner === payload.userId || payload.messageType === SOSMessageType.SOS_HELPER && p.id === payload.targetSosId)) return;
+    const events = (await list<ActiveSOSEvent>(KEYS.nearby)).filter(isLivePayload);
+    const previous = events.find(p => p.sosId === payload.sosId);
+    if (previous && previous.userId !== payload.userId) return;
+    if (payload.messageType === SOSMessageType.SOS_CANCEL) {
+      retired = payload.sosId;
+      await markCancelled(payload.sosId, payload.userId, expiresAt(payload) + 300000);
+    } else if (payload.messageType === SOSMessageType.SOS_ACK) {
+      if (payload.receiptKind === 'server' && payload.receiptStatus === 'cancelled' && payload.receiptUserId) {
+        retired = payload.targetSosId;
+        await markCancelled(payload.targetSosId!, payload.receiptUserId, expiresAt(payload) + 300000);
+      }
+    } else if (payload.messageType === SOSMessageType.SOS_HELPER) {
+      const target = events.find(p => p.sosId === payload.targetSosId);
+      if (target && (!requestIsOpen(target) || requestId(target) !== requestId(payload))) return;
+      if (payload.targetDeviceId === deviceId) {
+        if (!own.some(p => p.sosId === payload.targetSosId && requestIsOpen(p) && requestId(p) === requestId(payload))) return;
+        const offers = await list<SOSPayload>(KEYS.offers);
+        if (!canReplace(offers.find(p => p.sosId === payload.sosId), payload)) return;
+        await AsyncStorage.setItem(KEYS.offers, JSON.stringify([...offers.filter(p => p.sosId !== payload.sosId && expiresAt(p) + 3600000 > Date.now()), payload].slice(-100)));
+      }
+    } else {
+      if (previous && (payload.revision ?? 0) < (previous.revision ?? 0)) return;
+      if (!previous || (payload.revision ?? 0) > (previous.revision ?? 0)) {
+        const location = latestLocation(previous?.location ?? null, payload.location);
+        const distanceMeters = selfLocation && location ? bleMeshInstance.calculateDistance(selfLocation.latitude, selfLocation.longitude,
+          location.latitude, location.longitude) : undefined;
+        // This is the display snapshot only. Forward the untouched signed packet.
+        const event = { ...payload, location, distanceMeters };
+        await AsyncStorage.setItem(KEYS.nearby, JSON.stringify([...events.filter(p => p.sosId !== payload.sosId).slice(-199), event]));
+        helperNotice = requestIsOpen(payload) && (!previous || !requestIsOpen(previous) || requestId(previous) !== requestId(payload));
+        if (helperNotice) {
+          const hidden = await list<{ id: string; until: number }>(KEYS.dismissed);
+          await AsyncStorage.setItem(KEYS.dismissed, JSON.stringify(hidden.filter(p => p.id !== payload.sosId)));
+        }
+        if (helperNotice || !previous) eventToNotify = event;
+        // A new request/withdrawal cannot leave an old helper snapshot queued.
+        if (!requestIsOpen(payload) || previous && requestId(previous) !== requestId(payload)) {
+          await AsyncStorage.setItem(KEYS.relays, JSON.stringify((await list<SOSPayload>(KEYS.relays)).filter(p =>
+            !(p.messageType === SOSMessageType.SOS_HELPER && p.targetSosId === payload.sosId &&
+              (!requestIsOpen(payload) || requestId(p) !== requestId(payload))))));
+        }
+      }
+    }
+    accepted = true;
+    // Hop limits stop further radio forwarding, not the final internet upload.
+    if (payload.hopCount < payload.maxHops || [SOSMessageType.SOS_ALERT, SOSMessageType.SOS_CANCEL].includes(payload.messageType)) {
+      const candidate = bleMeshInstance.prepareRelay(payload, deviceId);
+      if (await enqueue(candidate)) packet = candidate;
+    }
+  });
+  if (retired) {
+    // The cancellation packet itself remains eligible to advertise.
+    await bleMeshInstance.retireSOS(retired, payload.messageType === SOSMessageType.SOS_CANCEL && payload.hopCount < payload.maxHops).catch(() => undefined);
+    await Promise.all(['sos', 'helper'].map(prefix => Notifications.dismissNotificationAsync(`${prefix}-${retired}`).catch(() => undefined)));
+  }
+  if (accepted && payload.messageType === SOSMessageType.SOS_ACK) await SOSTriggerService.acceptReceipt(payload);
+  if (packet) broadcast(packet);
+  if (eventToNotify) { bleMeshInstance.reportReceived(eventToNotify); await notify(eventToNotify, helperNotice).catch(() => undefined); }
+  if (accepted) await queuePeerReceipt(payload, deviceId, session.user.user_id, session.user.name).catch(() => undefined);
+  await Peripheral.acknowledgeInbox(encoded); // Durable writes always precede native ACK.
 }
 export async function helperOffers(sosId: string): Promise<SOSPayload[]> {
   const own = (await SOSTriggerService.activeSOS()).find(p => p.sosId === sosId);
@@ -163,10 +172,12 @@ export async function helperOffers(sosId: string): Promise<SOSPayload[]> {
 }
 export async function processMeshWork(): Promise<void> {
   if (!receiving) receiving = receiveInbox().finally(() => { receiving = undefined; });
-  await receiving;
+  // An inbox error must not block uploads of packets that are already queued.
+  const inboxError = await receiving.then(() => undefined, (error: unknown) => error ?? new Error('BLE inbox failed'));
   void SOSTriggerService.updateActiveLocations().catch(() => undefined);
   if (!forwarding) forwarding = forwardPending().finally(() => { forwarding = undefined; });
   await Promise.all([forwarding, SOSTriggerService.retryPendingQueue()]);
+  if (inboxError) throw inboxError;
 }
 async function forwardPending(): Promise<void> {
   const pending = await serial(async () => {
@@ -197,7 +208,10 @@ async function forwardPending(): Promise<void> {
     }
     // Persist the reverse-path receipt before marking an upload complete. If a
     // crash happens here, the idempotent upload can be safely repeated.
-    if (receipt) await queueServerReceipt(receipt);
+    // The server already has the packet. A receipt we cannot verify or store
+    // (e.g. CA key not saved yet) must not turn that into an endless re-upload
+    // that also blocks every packet after this one.
+    if (receipt) await queueServerReceipt(receipt).catch(error => console.warn('Server receipt skipped', error instanceof Error ? error.message : 'unknown'));
     await uploadSucceeded(payload);
     await serial(async () => {
       const latest = (await list<{ id: string; until: number }>(KEYS.forwarded)).filter(p => p.until > Date.now() && p.id !== packetKey(payload));

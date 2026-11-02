@@ -48,3 +48,20 @@ Physical four-phone, installation, launch, permission prompts, range, locked-scr
 - SOS packets expire after their TTL; extended partitions can exceed it. Offline cancellation drafts remain queued for owner HTTP synchronization.
 - Public-key trust and user roles are preserved. Existing refresh sessions are revocable; already-issued access JWTs retain their short lifetime.
 - `E-Kip19/suraksha-webgis` returned 404/authentication failure for the connected account. Its current implementation could not be audited. Backend WebSocket/outbox integration was preserved, but end-to-end WebGIS behavior is unverified.
+
+## BLE relay upload fix — 3 November 2026
+
+Problem: a phone could receive an SOS over BLE, but the relayed copy often never reached the server.
+
+| Finding | Root cause | Change |
+|---|---|---|
+| Relayed SOS never uploaded on slow or local-only Wi-Fi | A 1.5 s `/health` probe gated every upload; on Wi-Fi without public internet or a slow link it failed, so no upload was even tried | Only the network interface state gates uploads. The real API request and the durable retry/backoff decide success |
+| One bad inbox packet blocked queued uploads | `processMeshWork` awaited inbox processing first and threw before forwarding ran; one failing packet also stopped every packet after it | Each inbox packet is processed on its own (failures stay in the native inbox for the next tick); upload and retry run even when the inbox step fails, then the error is reported |
+| Upload accepted but retried forever | A server receipt that could not be verified/stored (e.g. CA key not saved yet) threw after a successful upload, so it was never marked forwarded and the loop skipped later packets | Receipt problems are logged and the upload is still completed; the sender falls back to a local "accepted" delivery state |
+| Phone deaf after a quick Bluetooth off/on | Android drops the scan and GATT server without callbacks; `scanning`/`advertising` stayed true until the 15 s tick happened to see Bluetooth off | Listen to `ACTION_STATE_CHANGED`; reset radio state on off and restart scan/adverts on on, keeping the packet queue |
+| Scan silently dead after app switching | Every foreground/background change restarted the scan; more than 5 starts in 30 s makes Android ignore the scan (older versions give no error) | Restart is debounced 3 s and scan starts are rate-limited to 4 per 30 s (pending start is scheduled, not dropped) |
+| Long scans stop returning results on some phones | Android can downgrade a scan running ~30 min to opportunistic | The service tick refreshes a scan older than 20 min |
+| Peer read from us fails while both phones read each other | The GATT server reset its per-phone cursor only on link disconnect; the shared LE link outlived the reader's connection, so the next read hit a finished/mid-way cursor. Closing our client also dropped the link mid-way through the peer's read, and equal 3 s cooldowns repeated the collision | Server restarts a transfer after a 2 s read gap and clears it after the last frame; client waits (max 10 s) for the peer's read before closing; random 0–2 s extra cooldown |
+| Crash loop of relay service | Android 14+ throws from `startForeground` for a connectedDevice service without Bluetooth permission (e.g. after a sticky restart); Android 12+ throws when starting it from background | Both are caught; the service stops cleanly and in-app scanning keeps running |
+
+Validation: 56 mobile tests pass (5 new, all failing on the old code), typecheck and lint pass, 7 `PacketPolicy` JVM tests pass. The full native module was not compiled locally (no Android SDK); the CI `android-native` job does that. Physical phone-to-phone BLE has NOT been tested; follow RELAY_TESTING.md.

@@ -34,4 +34,16 @@ class PacketPolicyTest {
         assertTrue(PacketPolicy.shouldPreempt("a", "a", 4, 4, true))
         assertTrue(PacketPolicy.shouldPreempt("a", "b", 4, 0, true))
     }
+    @Test fun scanStartsStayBelowAndroidThrottle() {
+        assertEquals(0, PacketPolicy.scanStartDelay(listOf(1000L, 2000L, 3000L), 4000L))
+        val wait = PacketPolicy.scanStartDelay(listOf(1000L, 2000L, 3000L, 4000L), 5000L)
+        assertEquals(1000L + 30000L - 5000L + 500L, wait)
+        // Starts older than the window no longer count.
+        assertEquals(0, PacketPolicy.scanStartDelay(listOf(1000L, 2000L, 3000L, 4000L), 40000L))
+    }
+    @Test fun reconnectAfterGapRestartsServerTransfer() {
+        assertFalse(PacketPolicy.transferIsLive(null, 5000L))
+        assertTrue(PacketPolicy.transferIsLive(4900L, 5000L))
+        assertFalse(PacketPolicy.transferIsLive(1000L, 5000L))
+    }
 }

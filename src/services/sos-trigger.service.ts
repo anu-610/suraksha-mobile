@@ -166,9 +166,16 @@ export class SOSTriggerService {
     if (!(await this.read<SOSPayload>(CANCEL_PACKETS)).some(p => p.sosId === receipt.targetSosId))
       void bleMeshInstance.retireSOS(receipt.targetSosId!).catch(() => undefined);
   }
-  private static async accepted(payload: SOSPayload, response: SOSResponse) {
+  /** Returns false when there was no usable signed receipt. */
+  private static async accepted(payload: SOSPayload, response: SOSResponse): Promise<boolean> {
     await uploadSucceeded(payload);
-    if (response.receipt) await this.acceptReceipt(await readServerReceipt(response.receipt));
+    return !!response.receipt && await this.applyServerReceipt(response.receipt);
+  }
+  // The server already stored the SOS. A receipt we cannot verify must not mark
+  // the upload failed, or the SOS is re-sent forever and blocks the queue.
+  private static async applyServerReceipt(token: string): Promise<boolean> {
+    try { await this.acceptReceipt(await readServerReceipt(token)); return true; }
+    catch (error) { console.warn('Server receipt skipped', error instanceof Error ? error.message : 'unknown'); return false; }
   }
   private static retrying: Promise<void> | undefined;
   public static retryPendingQueue(): Promise<void> {
@@ -216,8 +223,7 @@ export class SOSTriggerService {
       try {
         const response = packet?.originProof && isLivePayload(packet) ? await SOSApiService.sendSOS(packet) : await SOSApiService.cancelSOS(cancellation);
         if (packet) {
-          await this.accepted(packet, response);
-          if (!response.receipt) await recordReceipt({ ...packet, targetSosId: packet.sosId, targetDeviceId: packet.originDeviceId,
+          if (!await this.accepted(packet, response)) await recordReceipt({ ...packet, targetSosId: packet.sosId, targetDeviceId: packet.originDeviceId,
             receiptKind: 'server', receiptMessageType: SOSMessageType.SOS_CANCEL, receiptStatus: 'cancelled' });
         }
         await this.exclusive(async () => {
@@ -234,13 +240,12 @@ export class SOSTriggerService {
       if (!isOnline || !await mayUpload(payload)) continue;
       try {
         const response = await SOSApiService.sendSOS({ ...payload, authToken: undefined, deliveryMethod: DeliveryMethod.OFFLINE_QUEUED });
-        await this.accepted(payload, response);
-        if (!response.receipt) await recordReceipt({ ...payload, targetSosId: payload.sosId, targetDeviceId: payload.originDeviceId,
+        if (!await this.accepted(payload, response)) await recordReceipt({ ...payload, targetSosId: payload.sosId, targetDeviceId: payload.originDeviceId,
           receiptKind: 'server', receiptRevision: payload.revision ?? 0, receiptMessageType: SOSMessageType.SOS_ALERT, receiptStatus: 'accepted' });
         await this.exclusive(() => this.remove(payload.sosId, payload.revision ?? 0));
       } catch (error) {
         if (error instanceof ApiError && error.status === 410) {
-          if (error.receipt) await this.acceptReceipt(await readServerReceipt(error.receipt));
+          if (error.receipt) await this.applyServerReceipt(error.receipt);
           await this.exclusive(async () => {
             await this.remove(payload.sosId);
             await AsyncStorage.setItem(ACTIVE_KEY, JSON.stringify((await this.read<SOSPayload>(ACTIVE_KEY)).filter(p => p.sosId !== payload.sosId)));

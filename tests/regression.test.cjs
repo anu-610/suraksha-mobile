@@ -247,12 +247,83 @@ test('new nearby alerts and persistent dismissal are independent of a blocked up
   assert.equal((await runtime.nearbyEvents()).length,1);
 });
 
-test('local backend reachability works without public internet', async () => {
-  let requested;
-  const { NetworkService } = loader({ '@react-native-community/netinfo': {fetch:async()=>({isConnected:true,isInternetReachable:false,type:'wifi'})} },
-    {fetch:async url=>{requested=url;return {ok:true};}})('src/services/network.service.ts');
+test('local Wi-Fi without public internet allows uploads without a health probe gate', async () => {
+  let state={isConnected:true,isInternetReachable:false,type:'wifi'}; let probes=0;
+  const { NetworkService } = loader({ '@react-native-community/netinfo': {fetch:async()=>state} },
+    {fetch:async()=>{probes++;throw Error('probe must not gate uploads');}})('src/services/network.service.ts');
   assert.equal((await NetworkService.checkConnectivity()).isOnline,true);
-  assert.equal(requested,'https://example.test/health');
+  state={isConnected:null,isInternetReachable:null,type:'unknown'};
+  assert.equal((await NetworkService.checkConnectivity()).isOnline,true); // undecided: try, retry policy throttles
+  state={isConnected:false,isInternetReachable:false,type:'none'};
+  assert.equal((await NetworkService.checkConnectivity()).isOnline,false);
+  assert.equal(probes,0);
+});
+
+test('a BLE inbox failure does not block uploads of already queued relays', async () => {
+  const h=relayHarness({online:true});
+  const queued={...payload('queued-relay'),hopCount:1,relayChain:[{deviceId:'device-a',timestamp:new Date().toISOString()}]};
+  h.store.set('@suraksha.relay.pending.v2',JSON.stringify([queued]));
+  h.store.set('@suraksha.nearby.v2','{broken');
+  await assert.rejects(h.deliver({...payload('new-arrival'),originDeviceId:'device-c'}),/JSON/);
+  assert.ok(h.sent.some(p=>p.sosId==='queued-relay'));
+});
+
+test('one failing inbox packet does not stop later packets or the upload', async () => {
+  const store=new Map();let inbox=['bad','good'];const sent=[];
+  const runtime=loader({
+    '@react-native-async-storage/async-storage':{getItem:async k=>store.get(k)??null,setItem:async(k,v)=>store.set(k,v)},
+    'expo-notifications':{scheduleNotificationAsync:async()=>{},dismissNotificationAsync:async()=>{}},
+    'expo-location':{getLastKnownPositionAsync:async()=>null},'expo-background-task':{},'react-native':{Platform:{OS:'android'}},
+    '../../modules/ble-peripheral':{getInbox:async()=>[...inbox],acknowledgeInbox:async p=>{if(p==='bad')throw Error('native inbox busy');inbox=inbox.filter(v=>v!==p);}},
+    './ble-codec':{decodePayload:id=>({...payload(id),originDeviceId:'device-a'}),isLivePayload:()=>true},
+    './origin-security':{verifyOrigin:async()=>{}},
+    './session.service':{loadSession:async()=>({user:{user_id:'relay',name:'Relay'}})},
+    './network.service':{NetworkService:{checkConnectivity:async()=>({isOnline:true})}},
+    './mesh-receipts':{queuePeerReceipt:async()=>{},queueServerReceipt:async()=>{}},
+    './sos-api.service':{ApiError:class extends Error {},SOSApiService:{sendSOS:async p=>{sent.push(p.sosId);return {success:true};}}},
+    './sos-trigger.service':{SOSTriggerService:{getDeviceId:async()=>'device-b',retryPendingQueue:async()=>{},updateActiveLocations:async()=>{}},bleMeshInstance:{reportReceived(){},prepareRelay:p=>({...p,hopCount:1}),startAdvertising:async()=>{},retireSOS:async()=>{}}},
+  })('src/services/mesh-runtime.service.ts');
+  await assert.rejects(runtime.processMeshWork(),/native inbox busy/);
+  assert.deepEqual(inbox,['bad']); // retried next tick
+  assert.deepEqual(sent.sort(),['bad','good']);
+});
+
+test('an unverifiable server receipt still completes the relay upload and the next one', async () => {
+  const store=new Map();const sent=[];
+  const relays=['first','second'].map(id=>({...payload(id),hopCount:1}));
+  store.set('@suraksha.relay.pending.v2',JSON.stringify(relays));
+  const runtime=loader({
+    '@react-native-async-storage/async-storage':{getItem:async k=>store.get(k)??null,setItem:async(k,v)=>store.set(k,v)},
+    'expo-notifications':{},'expo-location':{},'expo-background-task':{},'react-native':{Platform:{OS:'android'}},
+    '../../modules/ble-peripheral':{getInbox:async()=>[],acknowledgeInbox:async()=>{}},
+    './origin-security':{verifyOrigin:async()=>{}},
+    './session.service':{loadSession:async()=>({user:{user_id:'relay',name:'Relay'}})},
+    './network.service':{NetworkService:{checkConnectivity:async()=>({isOnline:true})}},
+    './mesh-receipts':{queuePeerReceipt:async()=>{},queueServerReceipt:async()=>{throw Error('No trusted server receipt authority');}},
+    './sos-api.service':{ApiError:class extends Error {},SOSApiService:{sendSOS:async p=>{sent.push(p.sosId);return {success:true,receipt:'token'};}}},
+    './sos-trigger.service':{SOSTriggerService:{getDeviceId:async()=>'device-b',retryPendingQueue:async()=>{},updateActiveLocations:async()=>{}},bleMeshInstance:{startAdvertising:async()=>{},retireSOS:async()=>{}}},
+  })('src/services/mesh-runtime.service.ts');
+  await runtime.processMeshWork();
+  assert.deepEqual(sent,['first','second']);
+  await runtime.processMeshWork();
+  assert.equal(sent.length,2); // marked forwarded, not re-uploaded forever
+});
+
+test('an unverifiable server receipt does not keep the sender SOS queued forever', async () => {
+  const store=new Map();let uploads=0;
+  const service=loader({
+    '@react-native-async-storage/async-storage':{getItem:async k=>store.get(k)??null,setItem:async(k,v)=>store.set(k,v)},
+    './location.service':{LocationService:{availableLocation:()=>null,getCurrentLocation:async()=>payload().location}},
+    './origin-security':{signOrigin:async()=>({}),readServerReceipt:async()=>{throw Error('Untrusted server receipt');}},
+    './network.service':{NetworkService:{checkConnectivity:async()=>({isOnline:true})}},
+    './sos-api.service':{ApiError:class extends Error {},SOSApiService:{setAuthToken(){},sendSOS:async()=>{uploads++;return {success:true,receipt:'token'};}}},
+    './ble-mesh.service':{BLEMeshService:class {async requestPermissions(){} async startAdvertising(){} async retireSOS(){} }},
+  })('src/services/sos-trigger.service.ts').SOSTriggerService;
+  await service.triggerSOS(params); await service.updateActiveLocations(); await service.retryPendingQueue(); await service.retryPendingQueue();
+  assert.equal(JSON.parse(store.get('@suraksha_sos_queue')).length,0);
+  const delivery=JSON.parse(store.get('@suraksha.delivery.v3'))[0];
+  assert.equal(delivery.serverRevision,delivery.revision); assert.equal(delivery.error,undefined);
+  const done=uploads; await service.retryPendingQueue(); assert.equal(uploads,done);
 });
 
 test('SOS starts nearby advertising before attempting an online upload', async () => {

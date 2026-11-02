@@ -8,6 +8,7 @@ import android.content.*
 import android.os.*
 import android.util.Base64
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.facebook.react.HeadlessJsTaskService
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.jstasks.HeadlessJsTaskConfig
@@ -44,11 +45,17 @@ class BlePeripheralModule : Module() {
         AsyncFunction("stopAdvertising") { MeshRuntime.get(requireContext()).stopAdvertising(); true }
         AsyncFunction("startScanning") {
             val context = requireContext()
-            MeshRuntime.get(context).checkBluetooth()
+            // Scan first: a missing Nearby devices permission fails here with a clear
+            // message instead of inside the foreground service.
+            MeshRuntime.get(context).also { it.setForeground(appContext.currentActivity != null); it.startScanning() }
             context.getSharedPreferences("suraksha-transport", Context.MODE_PRIVATE).edit().putBoolean("relay-enabled", true).commit()
             val intent = Intent(context, MeshForegroundService::class.java)
-            if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent) else context.startService(intent)
-            MeshRuntime.get(context).also { it.setForeground(appContext.currentActivity != null); it.startScanning() }
+            try { if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent) else context.startService(intent) }
+            catch (error: Exception) {
+                // Android 12+ refuses this from the background. Scanning still runs in
+                // process; the next app launch starts the service.
+                MeshRuntime.listener?.invoke("onError", mapOf("error" to "Background relay starts next time Suraksha is opened"))
+            }
             true
         }
         AsyncFunction("stopScanning") {
@@ -71,6 +78,7 @@ class BlePeripheralModule : Module() {
 /** Android 14+ connectedDevice foreground service. Start only from explicit foreground opt-in. */
 class MeshForegroundService : Service() {
     private val handler = Handler(Looper.getMainLooper())
+    private var started = false
     private val tick = object : Runnable {
         override fun run() {
             if (!relayEnabled()) { stopSelf(); return }
@@ -93,12 +101,20 @@ class MeshForegroundService : Service() {
             .setSmallIcon(android.R.drawable.ic_dialog_info).setContentTitle("Suraksha nearby relay is active")
             .setContentText("Scanning for emergency alerts. Open Suraksha to stop.").setOngoing(true)
             .setContentIntent(launch?.let { PendingIntent.getActivity(this, 0, it, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT) }).build()
-        if (Build.VERSION.SDK_INT >= 29) startForeground(7310, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
-        else startForeground(7310, notification)
+        try {
+            if (Build.VERSION.SDK_INT >= 29) startForeground(7310, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            else startForeground(7310, notification)
+        } catch (error: Exception) {
+            // Android 14+ throws for a connectedDevice service without Bluetooth
+            // permission (e.g. revoked, then a sticky restart). Stop, don't crash-loop.
+            MeshRuntime.listener?.invoke("onError", mapOf("error" to "Nearby relay stopped. Allow Nearby devices permission and enable relay again."))
+            stopSelf(); return
+        }
+        started = true
         handler.post(tick)
     }
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (!relayEnabled()) { stopSelf(); return START_NOT_STICKY }
+        if (!started || !relayEnabled()) { stopSelf(); return START_NOT_STICKY }
         try { MeshRuntime.get(this).ensureRadio() }
         catch (error: Exception) {
             MeshRuntime.listener?.invoke("onError", mapOf("error" to (error.message ?: "Bluetooth unavailable")))
@@ -113,7 +129,8 @@ class MeshForegroundService : Service() {
     }
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
-        MeshRuntime.engine?.stopScanning()
+        // A service that never got foreground must not kill the in-app scan.
+        if (started) MeshRuntime.engine?.stopScanning()
         super.onDestroy()
     }
     override fun onBind(intent: Intent?): IBinder? = null
@@ -232,6 +249,7 @@ internal class MeshEngine(private val context: Context) {
     private val mtus = ConcurrentHashMap<String, Int>()
     private val chunkSizes = ConcurrentHashMap<String, Int>()
     private val lastSeen = ConcurrentHashMap<String, Long>()
+    private val lastReads = ConcurrentHashMap<String, Long>()
     private var advertExpiry: Runnable? = null
     private val advertTimeout = Runnable { failAdvertising("Advertising timed out") }
     fun checkBluetooth() { check(adapter?.isEnabled == true) { "Enable Bluetooth to use nearby relay" } }
@@ -251,36 +269,80 @@ internal class MeshEngine(private val context: Context) {
         MeshRuntime.listener?.invoke("onSOSReceived", mapOf("payloadBase64" to packet, "deviceId" to "native"))
         try { context.startService(Intent(context, MeshRelayTaskService::class.java)) } catch (_: Exception) {}
     }
-    @Synchronized fun ensureRadio() {
-        if (!adapter.isEnabled) {
-            stopScanning()
-            if (advertising || starting) {
-                stopRadio()
-            }
-            return
+    // Android kills the scan and GATT server with the radio and sends no scan or
+    // advertise callback, so `scanning`/`advertising` used to stay true and a
+    // quick off/on toggle left the phone deaf until the app was restarted.
+    // Keep scanWanted and the packet queue; only the radio state is reset.
+    @Synchronized private fun radioOff() {
+        scanning = false
+        handler.removeCallbacks(scanRetry); handler.removeCallbacks(dutyChange)
+        connections.values.forEach { try { it.close() } catch (_: Exception) {} }
+        connections.clear()
+        if (advertising || starting) stopRadio()
+    }
+    @Synchronized private fun radioOn() {
+        try {
+            if (scanWanted) startScanning()
+            resumeAdvertisements()
+        } catch (error: Exception) {
+            MeshRuntime.listener?.invoke("onError", mapOf("error" to (error.message ?: "Bluetooth restart failed")))
+            scheduleRadioRetry()
         }
+    }
+    private val bluetoothState = object : BroadcastReceiver() {
+        override fun onReceive(c: Context, intent: Intent) {
+            when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                BluetoothAdapter.STATE_TURNING_OFF, BluetoothAdapter.STATE_OFF -> radioOff()
+                // LE is not always usable the instant the adapter reports ON.
+                BluetoothAdapter.STATE_ON -> handler.postDelayed({ radioOn() }, 1000)
+            }
+        }
+    }
+    @Synchronized fun ensureRadio() {
+        if (!adapter.isEnabled) { radioOff(); return }
+        // Some phones quietly drop a scan that has run for ~30 min to
+        // opportunistic mode (no results). Refresh it well before that.
+        if (scanning && System.currentTimeMillis() - scanStartedAt > 20 * 60000L) restartScan()
         startScanning()
         resumeAdvertisements()
     }
-    fun setForeground(value: Boolean) {
+    private val scanStarts = ArrayDeque<Long>()
+    private var scanStartedAt = 0L
+    private var scanForeground = false
+    private val scanRetry = Runnable { synchronized(this) { if (scanWanted && !scanning) try { startScanning() } catch (_: Exception) {} } }
+    // Debounced so quick app switches don't burn Android's scan-start budget.
+    private val dutyChange = Runnable { synchronized(this) { if (scanning && scanForeground != foreground) restartScan() } }
+    @Synchronized fun setForeground(value: Boolean) {
         if (foreground == value) return
         foreground = value
-        if (scanning) {
-            // Change duty cycle without dropping active GATT transfers.
-            try { adapter.bluetoothLeScanner.stopScan(scanCallback); scanning = false; startScanning() }
-            catch (error: Exception) { MeshRuntime.listener?.invoke("onError", mapOf("error" to (error.message ?: "Cannot restart scan"))) }
-        }
+        handler.removeCallbacks(dutyChange)
+        handler.postDelayed(dutyChange, 3000)
+    }
+    @Synchronized private fun restartScan() {
+        // Change duty cycle without dropping active GATT transfers.
+        try { adapter.bluetoothLeScanner?.stopScan(scanCallback) } catch (_: Exception) {}
+        scanning = false
+        try { startScanning() }
+        catch (error: Exception) { MeshRuntime.listener?.invoke("onError", mapOf("error" to (error.message ?: "Cannot restart scan"))) }
     }
     @Synchronized fun startScanning() {
         scanWanted = true
         checkBluetooth()
         if (scanning) return
-        adapter.bluetoothLeScanner.startScan(listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE)).build()),
+        val now = System.currentTimeMillis()
+        val wait = PacketPolicy.scanStartDelay(scanStarts.toList(), now)
+        // Starting anyway would look fine here but Android may never deliver results.
+        if (wait > 0) { handler.removeCallbacks(scanRetry); handler.postDelayed(scanRetry, wait); return }
+        val scanner = adapter.bluetoothLeScanner ?: throw IllegalStateException("Enable Bluetooth to use nearby relay")
+        scanner.startScan(listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE)).build()),
             ScanSettings.Builder().setScanMode(if (foreground) ScanSettings.SCAN_MODE_LOW_LATENCY else ScanSettings.SCAN_MODE_BALANCED).build(), scanCallback)
+        scanStarts.addLast(now); while (scanStarts.size > 5) scanStarts.removeFirst()
+        scanStartedAt = now; scanForeground = foreground
         scanning = true
     }
-    fun stopScanning() {
+    @Synchronized fun stopScanning() {
         scanWanted = false
+        handler.removeCallbacks(scanRetry); handler.removeCallbacks(dutyChange)
         try { adapter?.bluetoothLeScanner?.stopScan(scanCallback) } catch (_: SecurityException) {}
         scanning = false
         connections.values.forEach { try { it.disconnect(); it.close() } catch (_: Exception) {} }
@@ -345,7 +407,7 @@ internal class MeshEngine(private val context: Context) {
         pending?.reject("BLE_STOPPED", "Advertising stopped", null); pending = null
         try { adapter?.bluetoothLeAdvertiser?.stopAdvertising(advertCallback) } catch (_: Exception) {}
         server?.close(); server = null; advertising = false
-        cursors.clear(); snapshots.clear(); mtus.clear(); chunkSizes.clear()
+        cursors.clear(); snapshots.clear(); mtus.clear(); chunkSizes.clear(); lastReads.clear()
     }
     private fun failAdvertising(message: String) {
         pending?.reject("BLE_ADV_ERROR", message, null); pending = null
@@ -362,12 +424,18 @@ internal class MeshEngine(private val context: Context) {
             adapter.bluetoothLeAdvertiser?.startAdvertising(settings, data, advertCallback) ?: failAdvertising("Peripheral mode unsupported")
         }
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, state: Int) {
-            cursors.remove(device.address); snapshots.remove(device.address); mtus.remove(device.address); chunkSizes.remove(device.address)
+            endTransfer(device.address); mtus.remove(device.address)
         }
         override fun onMtuChanged(device: BluetoothDevice, mtu: Int) { mtus[device.address] = mtu }
         override fun onCharacteristicReadRequest(device: BluetoothDevice, requestId: Int, offset: Int, characteristic: BluetoothGattCharacteristic) {
             if (offset != 0 || (characteristic.uuid != DATA && characteristic.uuid != FAST_DATA)) { server?.sendResponse(device,requestId,BluetoothGatt.GATT_INVALID_OFFSET,offset,null); return }
+            val now = System.currentTimeMillis()
+            // Two phones share one LE link, so it can outlive a reader's GATT
+            // connection. A reconnecting reader starts at frame 0; so must we.
+            lastReads.keys.filter { !PacketPolicy.transferIsLive(lastReads[it], now) }.forEach { endTransfer(it) }
+            if (!PacketPolicy.transferIsLive(lastReads[device.address], now)) endTransfer(device.address)
             if (snapshots.size >= 8 && !snapshots.containsKey(device.address)) { server?.sendResponse(device,requestId,BluetoothGatt.GATT_FAILURE,0,null); return }
+            lastReads[device.address] = now
             val snapshot = snapshots.getOrPut(device.address) { payload.copyOf() }
             val seq = cursors[device.address] ?: 0
             val chunkSize = chunkSizes.getOrPut(device.address) {
@@ -380,8 +448,11 @@ internal class MeshEngine(private val context: Context) {
             // Freeze chunk size per connection so sequence offsets stay consistent.
             val frame = byteArrayOf(83,75,2,(seq shr 8).toByte(),seq.toByte(),(total shr 8).toByte(),total.toByte(),chunk.size.toByte()) + chunk
             server?.sendResponse(device,requestId,BluetoothGatt.GATT_SUCCESS,0,frame)
-            cursors[device.address] = seq + 1
+            if (seq + 1 >= total) endTransfer(device.address) else cursors[device.address] = seq + 1
         }
+    }
+    private fun endTransfer(address: String) {
+        cursors.remove(address); snapshots.remove(address); chunkSizes.remove(address); lastReads.remove(address)
     }
     private val advertCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settings: AdvertiseSettings) { handler.removeCallbacks(advertTimeout); handler.removeCallbacks(retryRadio); retryDelay=1000L; advertising=true; starting=false; pending?.resolve(true); pending=null; handler.removeCallbacks(rotate); handler.postDelayed(rotate, 10000) }
@@ -406,9 +477,8 @@ internal class MeshEngine(private val context: Context) {
                 else -> "Bluetooth scanning interrupted (code $code); retrying shortly"
             }
             MeshRuntime.listener?.invoke("onError", mapOf("error" to reason))
-            handler.postDelayed({
-                if (scanWanted && !scanning) try { startScanning() } catch (_: Exception) {}
-            }, 6000)
+            handler.removeCallbacks(scanRetry)
+            handler.postDelayed(scanRetry, 6000)
         }
         override fun onScanResult(type: Int, result: ScanResult) {
             val device = result.device
@@ -430,8 +500,10 @@ internal class MeshEngine(private val context: Context) {
             @Synchronized fun finish(gatt: BluetoothGatt) {
                 if (finished) return
                 finished = true
-                lastSeen[device.address] = System.currentTimeMillis()
-                connections.remove(device.address, gatt); gatt.disconnect(); gatt.close()
+                // Random extra cooldown so two phones reading each other drift apart
+                // instead of colliding on every retry.
+                lastSeen[device.address] = System.currentTimeMillis() + (Math.random() * 2000).toLong()
+                closeWhenPeerDone(device, gatt, System.currentTimeMillis())
             }
             @Synchronized fun discover(gatt: BluetoothGatt) {
                 if (finished || discoveryStarted) return
@@ -486,5 +558,19 @@ internal class MeshEngine(private val context: Context) {
             }
             handler.postDelayed(idleTimeout, 15000)
         }
+    }
+    // Both phones share one LE link. Closing our client drops it, which cut the
+    // peer off mid-read of our (often larger) packet; with matching retry timing
+    // that could repeat on every attempt. Wait up to 10 s for the peer to finish.
+    private fun closeWhenPeerDone(device: BluetoothDevice, gatt: BluetoothGatt, since: Long) {
+        val now = System.currentTimeMillis()
+        if (PacketPolicy.transferIsLive(lastReads[device.address], now) && now - since < 10000) {
+            handler.postDelayed({ closeWhenPeerDone(device, gatt, since) }, 300); return
+        }
+        if (connections.remove(device.address, gatt)) try { gatt.disconnect(); gatt.close() } catch (_: Exception) {}
+    }
+    init {
+        // Last, so every field the receiver touches is already initialised.
+        ContextCompat.registerReceiver(context, bluetoothState, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED), ContextCompat.RECEIVER_NOT_EXPORTED)
     }
 }

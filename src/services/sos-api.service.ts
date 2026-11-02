@@ -28,18 +28,25 @@ export class SOSApiService {
   private static token: string | undefined;
   public static setAuthToken(token?: string) { this.token = token; }
 
-  private static async request<T>(path: string, options: RequestInit, token?: string): Promise<T> {
+  private static async request<T>(path: string, options: RequestInit, token?: string, renewed = false): Promise<T> {
     await loadApiSettings();
     const url = apiUrl(`/api/v1${path}`);
+    // Refresh has its own timeout. Do not spend the SOS HTTP budget waiting for
+    // credentials or let an old compatibility token shadow a refreshed account.
+    const accountToken = await sessionToken(renewed);
+    const accessToken = accountToken || token || this.token;
     { // Durable queues schedule subsequent attempts; a request must not monopolize the relay.
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 4000);
       try {
         const headers = new Headers(options.headers);
         if (!(options.body instanceof FormData)) headers.set('Content-Type', 'application/json');
-        const accessToken = token || this.token || await sessionToken();
         if (accessToken) headers.set('Authorization', `Bearer ${accessToken}`);
         const response = await fetch(url, { ...options, headers, signal: controller.signal });
+        if (response.status === 401 && accountToken && !renewed) {
+          clearTimeout(timer);
+          return this.request<T>(path, options, token, true);
+        }
         const text = await response.text();
         let data;
         try { data = text ? JSON.parse(text) : {}; } catch { data = {}; }

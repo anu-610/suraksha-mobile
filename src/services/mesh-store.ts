@@ -18,7 +18,12 @@ export async function list<T>(key: string): Promise<T[]> {
 /** Caller holds serial(). Transport runs only after this write completes. */
 export async function enqueue(packet: SOSPayload): Promise<boolean> {
   const pending = (await list<SOSPayload>(KEYS.relays)).filter(isLivePayload);
-  if (!canReplace(pending.find(p => p.sosId === packet.sosId), packet)) return false;
+  const current = pending.find(p => p.sosId === packet.sosId);
+  if (!canReplace(current, packet)) return false;
+  // Repeated scans need no write or immediate advertisement; the durable retry
+  // loop already restores accepted packets after a transient radio failure.
+  if (current && current.messageType === packet.messageType && current.revision === packet.revision &&
+      current.timestamp === packet.timestamp && current.hopCount === packet.hopCount) return false;
   await AsyncStorage.setItem(KEYS.relays, JSON.stringify([...pending.filter(p => p.sosId !== packet.sosId), packet]));
   return true;
 }

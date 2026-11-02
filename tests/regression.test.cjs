@@ -85,7 +85,7 @@ test('BLE round-trip excludes bearer tokens and rejects expired/oversized packet
 
 function queueHarness() {
   const store = new Map();
-  let locationCalls = 0; let failLocation = false; let blockSend; let blockAdvertise; let blockGPS; let cached = null; let online = false; let failSend = false; let failCancel = false; let advertise = false;
+  let locationCalls = 0; let failLocation = false; let failSigning = false; let blockSend; let blockAdvertise; let blockGPS; let cached = null; let online = false; let failSend = false; let failCancel = false; let advertise = false;
   const sent = [];
   const storage = { async getItem(key) { await Promise.resolve(); return store.get(key) ?? null; },
     async setItem(key,value) { await Promise.resolve(); store.set(key,value); } };
@@ -93,6 +93,7 @@ function queueHarness() {
     async requestPermissions() {}
     async startAdvertising() { if (blockAdvertise) await blockAdvertise(); if (!advertise) throw Error('No BLE'); }
     async stopAdvertising() {}
+    async retireSOS() {}
   }
   class ApiError extends Error {}
   const api = { setAuthToken() {}, async sendSOS(p) { if (p.messageType === 'SOS_CANCEL') { if (failCancel) throw Error('Offline'); return { success: true }; } if (blockSend) await blockSend(); if (failSend) throw Error('Offline'); sent.push(p); return { success: true }; },
@@ -101,14 +102,14 @@ function queueHarness() {
     '@react-native-async-storage/async-storage': storage,
     './location.service': { LocationService: { availableLocation: () => cached, async getCurrentLocation() { locationCalls++; if (blockGPS) await blockGPS(); if (failLocation) throw Error("No GPS"); return payload().location; } } },
     './network.service': { NetworkService: { async checkConnectivity() { return { isOnline: online }; } } },
-    './origin-security': { signOrigin: async () => ({ certificate: 'test', signedPayload: '{}', signature: 'test' }) },
+    './origin-security': { signOrigin: async () => { if (failSigning) throw Error('Expired device certificate'); return { certificate: 'test', signedPayload: '{}', signature: 'test' }; } },
     'expo-crypto': { randomUUID: require('node:crypto').randomUUID },
     './sos-api.service': { SOSApiService: api, ApiError }, './ble-mesh.service': { BLEMeshService },
   });
   const service = load('src/services/sos-trigger.service.ts').SOSTriggerService;
   return { service, store, sent, load,
     async start(values) { const p = await service.triggerSOS(values); await service.updateActiveLocations(); await service.retryPendingQueue(); return p; },
-    setCached(value) { cached = value; }, setBlockGPS(value) { blockGPS = value; }, setBlockAdvertise(value) { blockAdvertise = value; },
+    setFailSigning(value) { failSigning = value; }, setCached(value) { cached = value; }, setBlockGPS(value) { blockGPS = value; }, setBlockAdvertise(value) { blockAdvertise = value; },
     resetRetries() { store.delete('@suraksha.retry.v3'); },
     setBlockSend(value) { blockSend=value; }, setOnline(value) { online=value; }, setFailSend(value) { failSend=value; }, setFailCancel(value) { failCancel=value; },
     setAdvertise(value) { advertise=value; }, setFailLocation(value) { failLocation=value; }, locationCalls() { return locationCalls; } };
@@ -692,4 +693,114 @@ test('offline A to offline B to online C returns acceptance and cancellation rec
   await a.deliver(b.ads.find(p=>p.receiptStatus==='cancelled'));
   assert.equal(a.receipts.at(-1).receiptStatus,'cancelled');
   assert.equal((await b.runtime.nearbyEvents()).length,0);assert.equal((await c.runtime.nearbyEvents()).length,0);
+});
+
+test('GPS failure and stale fixes preserve signed active SOS coordinates', async () => {
+  const h=queueHarness(); await h.start(params);
+  const original=(await h.service.activeSOS())[0].location;
+  h.setFailLocation(true); await h.service.updateActiveLocations(undefined,true);
+  assert.equal((await h.service.activeSOS())[0].location.capturedAt,original.capturedAt);
+  await h.service.updateActiveLocations({...original,latitude:40,capturedAt:new Date(Date.parse(original.capturedAt)-1000).toISOString()},true);
+  assert.equal((await h.service.activeSOS())[0].location.latitude,original.latitude);
+  await h.service.updateActiveLocations({...original,latitude:41,accuracy:999},true);
+  assert.equal((await h.service.activeSOS())[0].location.latitude,original.latitude);
+});
+
+test('duplicate longer relay path cannot exhaust the retained packet hop budget', async () => {
+  const h=relayHarness(); const event={...payload('short-path'),protocolVersion:3,revision:0};
+  await h.deliver(event);
+  await h.deliver({...event,hopCount:14,relayChain:[{deviceId:'other',timestamp:event.timestamp}]});
+  const stored=JSON.parse(h.store.get('@suraksha.relay.pending.v2')).find(p=>p.sosId===event.sosId);
+  assert.equal(stored.hopCount,1);assert.equal(stored.uploadOnly,false);
+  assert.equal((await h.runtime.nearbyEvents()).length,1);
+});
+
+test('four simulated phones retain multiple offline incidents and deliver cancellation before delayed alerts', async () => {
+  const b=relayHarness({deviceId:'b'}),c=relayHarness({deviceId:'c'}),d=relayHarness({deviceId:'d'});
+  const events=[{...payload('a-first'),protocolVersion:3,revision:0},{...payload('a-second'),protocolVersion:3,revision:0}];
+  for(const source of events) {
+    await b.deliver(source);
+    await c.deliver(b.ads.find(p=>p.sosId===source.sosId));
+    await d.deliver(c.ads.find(p=>p.sosId===source.sosId));
+  }
+  assert.equal(b.sent.length+c.sent.length+d.sent.length,0);
+  assert.equal((await d.runtime.nearbyEvents()).length,2);
+  const cancel={...events[0],revision:1,messageType:'SOS_CANCEL',status:'CANCELLED',location:null};
+  await b.deliver(cancel);await c.deliver(b.ads.find(p=>p.messageType==='SOS_CANCEL'));
+  await d.deliver(c.ads.find(p=>p.messageType==='SOS_CANCEL'));
+  await d.deliver(events[0]); // A delayed original may never reactivate it.
+  d.setOnline(true);await d.runtime.processMeshWork();
+  assert.equal(d.sent[0].messageType,'SOS_CANCEL');
+  assert.equal(d.sent.filter(p=>p.sosId==='a-first'&&p.messageType==='SOS_ALERT').length,0);
+  assert.equal(d.sent.find(p=>p.sosId==='a-second').hopCount,3);
+  assert.equal((await d.runtime.nearbyEvents())[0].sosId,'a-second');
+  await d.runtime.processMeshWork();assert.equal(d.sent.length,2);
+});
+
+test('relay display preserves last location while forwarding the unmodified signed update', async () => {
+  const h=relayHarness(); const first={...payload('location-retained'),protocolVersion:3,revision:0};
+  await h.deliver(first);await h.deliver({...first,revision:1,location:null});
+  assert.equal((await h.runtime.nearbyEvents())[0].location.capturedAt,first.location.capturedAt);
+  const queued=JSON.parse(h.store.get('@suraksha.relay.pending.v2')).find(p=>p.sosId===first.sosId);
+  assert.equal(queued.location,null);assert.equal(queued.revision,1);
+});
+
+test('location watch is removed after a fix and after a timeout with late registration', async () => {
+  let removed=0;
+  const base={getForegroundPermissionsAsync:async()=>({granted:true}),hasServicesEnabledAsync:async()=>true,Accuracy:{High:4},
+    getLastKnownPositionAsync:async()=>null};
+  const location=loader({'expo-location':{...base,watchPositionAsync:async(_options,onFix)=>{
+    onFix({coords:{latitude:12,longitude:77,accuracy:8},timestamp:Date.now()});return {remove(){removed++;}};
+  }}})('src/services/location.service.ts');
+  assert.equal((await location.LocationService.getCurrentLocation(false)).latitude,12);
+  await new Promise(r=>setImmediate(r));assert.equal(removed,1);
+  let release;
+  const late=new Promise(r=>{release=r;});
+  const timeout=loader({'expo-location':{...base,watchPositionAsync:()=>late}},
+    {setTimeout:(fn,ms)=>setTimeout(fn,ms===15000?1:ms)})('src/services/location.service.ts');
+  await assert.rejects(timeout.LocationService.getCurrentLocation(false),/Unable to obtain/);
+  release({remove(){removed++;}});await new Promise(r=>setImmediate(r));assert.equal(removed,2);
+});
+
+test('concurrent background tracking starts coalesce and cancellation stops the pending start', async () => {
+  let starts=0,stops=0,enabled=false;
+  const tracking=loader({'react-native':{Platform:{OS:'android'}},'expo-location':{
+    Accuracy:{High:4},requestForegroundPermissionsAsync:async()=>({granted:true}),requestBackgroundPermissionsAsync:async()=>({granted:true}),
+    hasStartedLocationUpdatesAsync:async()=>enabled,startLocationUpdatesAsync:async()=>{starts++;enabled=true;},
+    stopLocationUpdatesAsync:async()=>{stops++;enabled=false;}
+  }})('src/services/sos-tracking.service.ts');
+  await Promise.all([tracking.startSOSTracking(),tracking.startSOSTracking(),tracking.stopSOSTracking()]);
+  assert.equal(starts,1);assert.equal(stops,1);assert.equal(enabled,false);
+});
+
+test('401 refresh retries once with account credentials instead of stale compatibility token', async () => {
+  const calls=[];let refreshes=0;
+  const api=loader({'./session.service':{sessionToken:async(force)=>{if(force)refreshes++;return force?'fresh':'expired';}}},
+    {fetch:async(_url,options)=>{calls.push(options.headers.get('Authorization'));return calls.length===1?
+      new Response('{}',{status:401}):new Response(JSON.stringify({success:true,sos_id:'one'}));}})('src/services/sos-api.service.ts');
+  api.SOSApiService.setAuthToken('stale');await api.SOSApiService.sendSOS(payload());
+  assert.deepEqual(calls,['Bearer expired','Bearer fresh']);assert.equal(refreshes,1);
+});
+
+
+test('expired signing credentials cannot block local cancellation or authenticated online recovery', async () => {
+  const h=queueHarness();const event=await h.start(params);h.setFailSigning(true);
+  await h.service.cancelSOS(event.sosId,'owner');
+  assert.equal((await h.service.activeSOS()).length,0);
+  assert.equal(h.store.get('@suraksha_sos_queue'),'[]');
+  const draft=JSON.parse(h.store.get('@suraksha.cancel.packets.v2'))[0];
+  assert.equal(draft.messageType,'SOS_CANCEL');assert.equal(draft.originProof,undefined);
+  h.setOnline(true);await h.service.retryPendingQueue();
+  assert.equal(h.store.get('@suraksha_sos_cancellations'),'[]');
+});
+
+test('background GPS fix arriving during a pending lookup is retained after it finishes', async () => {
+  const h=queueHarness();await h.start(params);
+  let release,began;const blocked=new Promise(r=>{release=r;});const started=new Promise(r=>{began=r;});
+  h.setBlockGPS(async()=>{began();await blocked;});
+  const lookup=h.service.updateActiveLocations(undefined,true);await started;
+  const fix={...payload().location,latitude:18,capturedAt:new Date(Date.now()+1000).toISOString()};
+  const callback=h.service.updateActiveLocations(fix,true);release();
+  await Promise.all([lookup,callback]);
+  assert.equal((await h.service.activeSOS())[0].location.latitude,18);
 });

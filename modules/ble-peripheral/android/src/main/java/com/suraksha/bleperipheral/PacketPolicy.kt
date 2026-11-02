@@ -2,7 +2,7 @@ package com.suraksha.bleperipheral
 
 /** Pure policy: radio failures never decide whether an accepted packet is deleted. */
 internal data class PacketVersion(val owner: String, val type: String, val revision: Long,
-    val timestamp: Long, val helperState: String = "")
+    val timestamp: Long, val helperState: String = "", val hops: Int = 0)
 
 internal object PacketPolicy {
     fun canReplace(old: PacketVersion?, next: PacketVersion): Boolean {
@@ -11,8 +11,11 @@ internal object PacketPolicy {
         if (old.type == "SOS_CANCEL" && next.type != "SOS_CANCEL") return false
         if (next.type == "SOS_CANCEL" && old.type != "SOS_CANCEL") return true
         if (old.helperState == "withdrawn" && next.type == "SOS_HELPER" && next.helperState != "withdrawn") return false
-        return next.revision > old.revision || (next.revision == old.revision && next.timestamp >= old.timestamp)
+        return next.revision > old.revision || (next.revision == old.revision &&
+            (next.timestamp > old.timestamp || next.timestamp == old.timestamp && next.hops <= old.hops))
     }
+    fun shouldPreempt(currentId: String?, nextId: String, currentPriority: Int, nextPriority: Int,
+                      changed: Boolean): Boolean = changed && (currentId == null || currentId == nextId || nextPriority < currentPriority)
     fun priority(type: String, helperState: String, requested: Boolean): Int = when {
         type == "SOS_CANCEL" -> 0
         helperState == "withdrawn" -> 1

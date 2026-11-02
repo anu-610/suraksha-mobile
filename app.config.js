@@ -9,7 +9,7 @@ module.exports = ({ config }) => {
     name: 'Suraksha Test',
     version: '1.1.0',
     scheme: 'suraksha-test',
-    android: { ...config.android, package: 'com.suraksha.emergency.localtest', versionCode: 6 },
+    android: { ...config.android, package: 'com.suraksha.emergency.localtest', versionCode: 7 },
     plugins: config.plugins.map(plugin => Array.isArray(plugin) && plugin[0] === 'expo-build-properties'
       ? [plugin[0], { ...plugin[1], android: { ...plugin[1].android, usesCleartextTraffic: true } }]
       : plugin),

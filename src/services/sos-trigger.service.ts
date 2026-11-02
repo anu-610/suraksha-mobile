@@ -2,6 +2,7 @@ import { signOrigin, readServerReceipt } from './origin-security';
 import * as Crypto from 'expo-crypto';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { LocationService } from './location.service';
+import { latestLocation } from './location-policy';
 import { NetworkService } from './network.service';
 import { SOSApiService, ApiError } from './sos-api.service';
 import { BLEMeshService } from './ble-mesh.service';
@@ -73,6 +74,7 @@ export class SOSTriggerService {
     if (authToken) SOSApiService.setAuthToken(authToken);
     const cancellation: SOSCancellation = { sosId, userId, reason, cancelledAt: new Date().toISOString() };
     let packet: SOSPayload | undefined;
+    let signingError: string | undefined;
     await this.exclusive(async () => {
       const active = await this.read<SOSPayload>(ACTIVE_KEY);
       const source = active.find(item => item.sosId === sosId && item.userId === userId);
@@ -81,8 +83,9 @@ export class SOSTriggerService {
           messageType: SOSMessageType.SOS_CANCEL, status: SOSStatus.CANCELLED,
           timestamp: cancellation.cancelledAt, location: null, helperRequested: false,
           helperState: source.helperRequestId ? 'withdrawn' : undefined,
-          message: reason, hopCount: 0, relayChain: [] };
-        packet.originProof = await signOrigin(packet, false);
+          message: reason, hopCount: 0, relayChain: [], originProof: undefined };
+        try { packet.originProof = await signOrigin(packet, false); }
+        catch { signingError = 'Cancelled locally. Bluetooth proof unavailable; reconnect to synchronize cancellation.'; }
         const packets = await this.read<SOSPayload>(CANCEL_PACKETS);
         await AsyncStorage.setItem(CANCEL_PACKETS, JSON.stringify([...packets.filter(p => p.sosId !== sosId), packet]));
       }
@@ -91,7 +94,14 @@ export class SOSTriggerService {
       await AsyncStorage.setItem(CANCEL_KEY, JSON.stringify([...pending.filter(item => item.sosId !== sosId), cancellation]));
       await this.remove(sosId);
     });
-    if (packet) { await recordSaved(packet); this.broadcast(packet); }
+    if (packet) {
+      await recordSaved(packet);
+      if (packet.originProof) this.broadcast(packet);
+      else {
+        void bleMeshInstance.retireSOS(sosId).catch(() => undefined);
+        await recordDeliveryError(packet, signingError!);
+      }
+    }
     void this.retryPendingQueue().catch(() => undefined);
     return false; // UI watches durable delivery state for later confirmation.
   }
@@ -120,6 +130,8 @@ export class SOSTriggerService {
   }
   private static updating: Promise<void> | undefined;
   public static updateActiveLocations(fix?: SOSLocation, force = false): Promise<void> {
+    // An OS background fix arriving during a foreground lookup must not be lost.
+    if (fix && this.updating) return this.updating.then(() => this.updateActiveLocations(fix, force));
     return this.updating ??= this.refreshLocations(fix, force).finally(() => { this.updating = undefined; });
   }
   private static async refreshLocations(fix?: SOSLocation, force = false): Promise<void> {
@@ -133,7 +145,7 @@ export class SOSTriggerService {
         const current = active.find(p => p.sosId === old.sosId);
         if (!current || !isLivePayload(current) || (await this.read<SOSPayload>(CANCEL_PACKETS)).some(p => p.sosId === current.sosId)) return;
         next = { ...current, protocolVersion: 3, revision: (current.revision ?? 0) + 1,
-          timestamp: new Date().toISOString(), location, hopCount: 0, relayChain: [] };
+          timestamp: new Date().toISOString(), location: latestLocation(current.location, location), hopCount: 0, relayChain: [] };
         next.originProof = await signOrigin(next, false);
         await AsyncStorage.setItem(ACTIVE_KEY, JSON.stringify(active.map(p => p.sosId === next!.sosId ? next : p)));
         const queue = await this.read<SOSPayload>(QUEUE_KEY);
@@ -180,7 +192,20 @@ export class SOSTriggerService {
       await AsyncStorage.setItem(CANCEL_PACKETS, JSON.stringify(packets.filter(p => isLivePayload(p) || pending.some(c => c.sosId === p.sosId))));
       return packets;
     });
-    packets.filter(isLivePayload).forEach(p => this.broadcast(p));
+    // An expired/missing certificate must not prevent local cancellation. Retry
+    // signing the durable draft after normal device enrollment recovers.
+    for (const packet of packets.filter(isLivePayload)) {
+      if (!packet.originProof) {
+        try {
+          packet.originProof = await signOrigin(packet, false);
+          await this.exclusive(async () => {
+            const latest = await this.read<SOSPayload>(CANCEL_PACKETS);
+            await AsyncStorage.setItem(CANCEL_PACKETS, JSON.stringify(latest.map(p => p.sosId === packet.sosId && p.revision === packet.revision ? packet : p)));
+          });
+        } catch { continue; }
+      }
+      this.broadcast(packet);
+    }
     const cancellations = await this.exclusive(() => this.read<SOSCancellation>(CANCEL_KEY));
     const queue = await this.exclusive(() => this.read<SOSPayload>(QUEUE_KEY));
     if (!cancellations.length && !queue.length) return;
@@ -189,7 +214,7 @@ export class SOSTriggerService {
       const packet = packets.find(p => p.sosId === cancellation.sosId);
       if (!isOnline || (packet && !await mayUpload(packet))) continue;
       try {
-        const response = packet && isLivePayload(packet) ? await SOSApiService.sendSOS(packet) : await SOSApiService.cancelSOS(cancellation);
+        const response = packet?.originProof && isLivePayload(packet) ? await SOSApiService.sendSOS(packet) : await SOSApiService.cancelSOS(cancellation);
         if (packet) {
           await this.accepted(packet, response);
           if (!response.receipt) await recordReceipt({ ...packet, targetSosId: packet.sosId, targetDeviceId: packet.originDeviceId,

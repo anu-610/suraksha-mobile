@@ -17,6 +17,7 @@ import { canReplace, expiresAt, packetKey, packetPriority, requestId, requestIsO
 import { queuePeerReceipt, queueServerReceipt } from './mesh-receipts';
 import { mayUpload, uploadFailed, uploadSucceeded } from './retry-policy';
 import type { HelperChoice } from './helper-consent.service';
+import { latestLocation } from './location-policy';
 export { shareHelperLocation, respondToHelper, helperChoices, helperResponseState } from './helper-consent.service';
 
 export const RETRY_TASK = 'suraksha-sos-retry-v2';
@@ -116,9 +117,11 @@ async function receiveInbox(): Promise<void> {
       } else {
         if (previous && (payload.revision ?? 0) < (previous.revision ?? 0)) return;
         if (!previous || (payload.revision ?? 0) > (previous.revision ?? 0)) {
-          const distanceMeters = selfLocation && payload.location ? bleMeshInstance.calculateDistance(selfLocation.latitude, selfLocation.longitude,
-            payload.location.latitude, payload.location.longitude) : undefined;
-          const event = { ...payload, distanceMeters };
+          const location = latestLocation(previous?.location ?? null, payload.location);
+          const distanceMeters = selfLocation && location ? bleMeshInstance.calculateDistance(selfLocation.latitude, selfLocation.longitude,
+            location.latitude, location.longitude) : undefined;
+          // This is the display snapshot only. Forward the untouched signed packet.
+          const event = { ...payload, location, distanceMeters };
           await AsyncStorage.setItem(KEYS.nearby, JSON.stringify([...events.filter(p => p.sosId !== payload.sosId).slice(-199), event]));
           helperNotice = requestIsOpen(payload) && (!previous || !requestIsOpen(previous) || requestId(previous) !== requestId(payload));
           if (helperNotice) {
@@ -137,13 +140,13 @@ async function receiveInbox(): Promise<void> {
       accepted = true;
       // Hop limits stop further radio forwarding, not the final internet upload.
       if (payload.hopCount < payload.maxHops || [SOSMessageType.SOS_ALERT, SOSMessageType.SOS_CANCEL].includes(payload.messageType)) {
-        packet = bleMeshInstance.prepareRelay(payload, deviceId);
-        await enqueue(packet);
+        const candidate = bleMeshInstance.prepareRelay(payload, deviceId);
+        if (await enqueue(candidate)) packet = candidate;
       }
     });
     if (retired) {
       // The cancellation packet itself remains eligible to advertise.
-      await bleMeshInstance.retireSOS(retired, packet?.messageType === SOSMessageType.SOS_CANCEL && !packet.uploadOnly).catch(() => undefined);
+      await bleMeshInstance.retireSOS(retired, payload.messageType === SOSMessageType.SOS_CANCEL && payload.hopCount < payload.maxHops).catch(() => undefined);
       await Promise.all(['sos', 'helper'].map(prefix => Notifications.dismissNotificationAsync(`${prefix}-${retired}`).catch(() => undefined)));
     }
     if (accepted && payload.messageType === SOSMessageType.SOS_ACK) await SOSTriggerService.acceptReceipt(payload);

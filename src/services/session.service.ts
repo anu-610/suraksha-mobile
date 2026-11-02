@@ -35,10 +35,10 @@ export async function establishSession(accessToken: string, refreshToken?: strin
   await save(session);
   return session;
 }
-export async function sessionToken(): Promise<string | undefined> {
+export async function sessionToken(forceRefresh = false): Promise<string | undefined> {
   const session = await loadSession();
   if (!session) return undefined;
-  if (session.expiresAt > Date.now() + 60000) return session.accessToken;
+  if (!forceRefresh && session.expiresAt > Date.now() + 60000) return session.accessToken;
   if (!session.refreshToken) return session.accessToken;
   if (session.provider !== 'local' && (!oidcIssuer || !oidcClient)) return session.accessToken;
   if (!refresh) refresh = (async () => {
@@ -62,12 +62,14 @@ export async function sessionToken(): Promise<string | undefined> {
 }
 export async function signOut(): Promise<void> {
   const old = await loadSession();
+  // Invalidate before awaiting network revocation so an in-flight refresh cannot
+  // restore the signed-out session, and local logout works while offline.
+  current = null;
+  if (Platform.OS !== 'web') await SecureStore.deleteItemAsync(KEY, options);
   // Revoke online when possible; local sign-out always removes credentials.
   if (old?.provider === 'local' && old.refreshToken) {
     try { await timedFetch(apiUrl('/api/v1/accounts/logout'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ refresh_token: old.refreshToken }) }); } catch { /* Server-side session can be revoked by the operator if offline. */ }
   }
-  current = null;
-  if (Platform.OS !== 'web') await SecureStore.deleteItemAsync(KEY, options);
 }
 
 export async function passwordSignIn(email: string, password: string, registration?: { name: string; phone: string }): Promise<Session> {

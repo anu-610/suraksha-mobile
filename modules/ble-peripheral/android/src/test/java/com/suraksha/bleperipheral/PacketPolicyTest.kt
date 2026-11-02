@@ -21,4 +21,17 @@ class PacketPolicyTest {
         assertFalse(PacketPolicy.hasCapacity(132, false, 0))
         assertTrue(PacketPolicy.priority("SOS_CANCEL", "", false) < PacketPolicy.priority("SOS_ALERT", "", true))
     }
+    @Test fun duplicateLongerPathsCannotReplaceShorterRoutes() {
+        val short = PacketVersion("a", "SOS_ALERT", 1, 1000, hops = 1)
+        assertFalse(PacketPolicy.canReplace(short, short.copy(hops = 14)))
+        assertTrue(PacketPolicy.canReplace(short, short.copy(hops = 0)))
+        assertTrue(PacketPolicy.canReplace(short, short.copy(revision = 2, hops = 14)))
+    }
+    @Test fun retriesAndEqualPriorityDoNotPreemptRotation() {
+        assertFalse(PacketPolicy.shouldPreempt("a", "b", 4, 4, false))
+        assertFalse(PacketPolicy.shouldPreempt("a", "b", 4, 4, true))
+        assertFalse(PacketPolicy.shouldPreempt("a", "a", 4, 4, false))
+        assertTrue(PacketPolicy.shouldPreempt("a", "a", 4, 4, true))
+        assertTrue(PacketPolicy.shouldPreempt("a", "b", 4, 0, true))
+    }
 }

@@ -158,7 +158,7 @@ internal class MeshEngine(private val context: Context) {
     private fun version(bytes: ByteArray): PacketVersion {
         val p = objectData(bytes)
         return PacketVersion(p.getString("userId"), p.getString("messageType"), p.optLong("revision", 0),
-            java.time.Instant.parse(p.getString("timestamp")).toEpochMilli(), p.optString("helperState", ""))
+            java.time.Instant.parse(p.getString("timestamp")).toEpochMilli(), p.optString("helperState", ""), p.optInt("hopCount", 0))
     }
     private fun priority(bytes: ByteArray): Int {
         val p = objectData(bytes)
@@ -297,7 +297,11 @@ internal class MeshEngine(private val context: Context) {
                 val previous = versions[id] ?: packets[id]
                 if (!PacketPolicy.canReplace(previous?.let { version(it) }, version(bytes))) { promise.resolve(true); return }
                 check(PacketPolicy.hasCapacity(packets.size, packets.containsKey(id), priority(bytes))) { "Relay advertising queue is full" }
-                if (packets[id]?.contentEquals(bytes) != true && (payload.isEmpty() || priority(bytes) <= priority(payload))) payload = bytes
+                // Routine durable retries must not reset round-robin rotation.
+                // Only a genuinely urgent packet or the current packet's update preempts.
+                if (PacketPolicy.shouldPreempt(if (payload.isEmpty()) null else objectData(payload).getString("sosId"),
+                        id, if (payload.isEmpty()) Int.MAX_VALUE else priority(payload), priority(bytes),
+                        packets[id]?.contentEquals(bytes) != true)) payload = bytes
                 packets[id] = bytes
                 versions[id] = bytes
                 // A verified cancellation/request change also retires old consent snapshots.

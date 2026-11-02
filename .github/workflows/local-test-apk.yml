@@ -1,7 +1,7 @@
 name: Local test APK
 on:
   push:
-    branches: [master, codex/sos-live-updates-20261101]
+    branches: [master, codex/sos-live-updates-20261101, 'fix/sos-mesh-reliability-*']
     paths: ['.github/workflows/local-test-apk.yml', 'app.config.js', 'app.json', 'modules/**', 'src/**', 'tests/**', 'package*.json']
   workflow_dispatch:
     inputs:
@@ -42,10 +42,11 @@ jobs:
       - run: |
           mkdir -p test-apk
           cp android/app/build/outputs/apk/release/app-release.apk test-apk/suraksha-local-test.apk
+          git rev-parse HEAD > test-apk/SOURCE_COMMIT.txt
           sha256sum test-apk/suraksha-local-test.apk > test-apk/SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: suraksha-local-test-apk
+          name: suraksha-local-test-apk-${{ github.sha }}
           path: test-apk/
           retention-days: 14
           if-no-files-found: error

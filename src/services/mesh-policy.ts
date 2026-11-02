@@ -19,5 +19,7 @@ export function canReplace(current: SOSPayload | undefined, next: SOSPayload): b
   if (next.messageType === SOSMessageType.SOS_CANCEL && current.messageType !== SOSMessageType.SOS_CANCEL) return true;
   if (current.helperState === 'withdrawn' && next.messageType === SOSMessageType.SOS_HELPER && next.helperState !== 'withdrawn') return false;
   return (next.revision ?? 0) > (current.revision ?? 0) ||
-    ((next.revision ?? 0) === (current.revision ?? 0) && Date.parse(next.timestamp) >= Date.parse(current.timestamp));
+    ((next.revision ?? 0) === (current.revision ?? 0) &&
+      (Date.parse(next.timestamp) > Date.parse(current.timestamp) ||
+       Date.parse(next.timestamp) === Date.parse(current.timestamp) && next.hopCount <= current.hopCount));
 }

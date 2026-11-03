@@ -23,6 +23,7 @@ import { startSOSTracking, stopSOSTracking } from '../services/sos-tracking.serv
 import { setRelayEnabled, isRelayEnabled, helperOffers, helperResponseState } from '../services/mesh-runtime.service';
 import { HelperConsentCard } from '../components/HelperConsentCard';
 import { BluetoothBanner } from '../components/BluetoothBanner';
+import { NearbyStatus } from '../components/NearbyStatus';
 import { locationDescription } from '../services/location.service';
 import { deliveryStates, deliveryLabel } from '../services/delivery.service';
 import { requestExpiry, requestIsOpen } from '../services/mesh-policy';
@@ -203,6 +204,7 @@ export default function Index() {
           setRelayDevice(relayDevice ? null : await SOSTriggerService.getDeviceId());
         } catch (error) { setStatusMsg(error instanceof Error ? error.message : 'Unable to enable nearby relay.'); }
       }}><Text style={styles.statusText}>{relayDevice ? 'Stop nearby relay' : 'Enable nearby relay'}</Text></TouchableOpacity>
+      {session && <NearbyStatus />}
       {session && <RelayPanel deviceId={relayDevice ?? ''} userId={userId} />}
       {/* ── SOS Button ── */}
       <View style={styles.center}>

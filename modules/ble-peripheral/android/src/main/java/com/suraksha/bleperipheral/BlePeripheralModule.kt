@@ -83,9 +83,19 @@ class BlePeripheralModule : Module() {
             val context = requireContext()
             context.getSharedPreferences("suraksha-transport", Context.MODE_PRIVATE).edit().putBoolean("relay-enabled", false).commit()
             context.stopService(Intent(context, MeshForegroundService::class.java))
-            MeshRuntime.get(context).stopScanning()
+            MeshRuntime.get(context).relayOff()
             true
         }
+        // Listen for nearby SOS while Suraksha is on screen, even with the opt-in
+        // background relay off. Before, a phone without relay enabled heard nothing.
+        AsyncFunction("listenInApp") { enabled: Boolean ->
+            val engine = MeshRuntime.get(requireContext())
+            engine.listenInApp = enabled
+            if (!enabled) engine.relayOff()
+            else if (appContext.currentActivity != null) { engine.setForeground(true); engine.startScanning() }
+            true
+        }
+        AsyncFunction("getStatus") { MeshRuntime.get(requireContext()).status() }
         AsyncFunction("broadcastCancellation") { _: String -> false }
         AsyncFunction("getInbox") { MeshRuntime.get(requireContext()).inbox() }
         AsyncFunction("acknowledgeInbox") { packet: String -> MeshRuntime.get(requireContext()).acknowledge(packet) }
@@ -153,7 +163,7 @@ class MeshForegroundService : Service() {
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
         // A service that never got foreground must not kill the in-app scan.
-        if (started) MeshRuntime.engine?.stopScanning()
+        if (started) MeshRuntime.engine?.relayOff()
         super.onDestroy()
     }
     override fun onBind(intent: Intent?): IBinder? = null
@@ -175,7 +185,35 @@ internal class MeshEngine(private val context: Context) {
     private val adapter get() = (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter ?: throw IllegalStateException("Bluetooth unsupported")
     private val handler = Handler(Looper.getMainLooper())
     private val prefs = context.getSharedPreferences("suraksha-transport", Context.MODE_PRIVATE)
-    private var foreground = false
+    @Volatile var foreground = false
+        private set
+    @Volatile var listenInApp = false
+    // Numbers for the on-screen Bluetooth status card.
+    @Volatile private var lastError = ""
+    @Volatile private var lastErrorAt = 0L
+    @Volatile private var receivedCount = 0
+    @Volatile private var lastReceivedAt = 0L
+    @Volatile private var servedCount = 0
+    @Volatile private var lastServedAt = 0L
+    @Volatile private var failedReads = 0
+    private val seenAt = ConcurrentHashMap<String, Long>()
+    private fun report(message: String) {
+        lastError = message; lastErrorAt = System.currentTimeMillis()
+        MeshRuntime.listener?.invoke("onError", mapOf("error" to message))
+    }
+    @Synchronized fun status(): Map<String, Any> {
+        val now = System.currentTimeMillis()
+        seenAt.entries.removeAll { now - it.value > 60000 }
+        return mapOf("bluetoothOn" to (try { adapter.isEnabled } catch (_: Exception) { false }),
+            "advertising" to advertising, "queued" to packets.size, "scanning" to scanning,
+            "backgroundRelay" to prefs.getBoolean("relay-enabled", false), "nearbyPhones" to seenAt.size,
+            "lastSeenAt" to (seenAt.values.maxOrNull() ?: 0L).toDouble(),
+            "received" to receivedCount, "lastReceivedAt" to lastReceivedAt.toDouble(),
+            "served" to servedCount, "lastServedAt" to lastServedAt.toDouble(), "failedReads" to failedReads,
+            "lastError" to lastError, "lastErrorAt" to lastErrorAt.toDouble(), "inbox" to inbox().size)
+    }
+    /** Relay service is going away: keep scanning only for an on-screen app that listens. */
+    @Synchronized fun relayOff() { if (!(listenInApp && foreground)) stopScanning() }
     private var scanWanted = false
     private var scanning = false
     private var advertising = false
@@ -218,7 +256,7 @@ internal class MeshEngine(private val context: Context) {
                 val now = System.currentTimeMillis()
                 packets.entries.removeAll { expires(it.value) <= now }
                 try { persistPackets() } catch (error: Exception) {
-                    MeshRuntime.listener?.invoke("onError", mapOf("error" to (error.message ?: "Cannot persist BLE queue")))
+                    report(error.message ?: "Cannot persist BLE queue")
                 }
                 if (packets.isEmpty()) { stopAdvertising(); return }
                 payload = nextPacket()
@@ -285,6 +323,7 @@ internal class MeshEngine(private val context: Context) {
     @Synchronized private fun received(bytes: ByteArray) {
         val packet = Base64.encodeToString(bytes, Base64.NO_WRAP)
         val existing = inbox()
+        receivedCount++; lastReceivedAt = System.currentTimeMillis()
         if (!existing.contains(packet)) {
             // Bound attacker-controlled storage. Never evict already accepted inbox items.
             if (existing.size >= 100) return
@@ -309,7 +348,7 @@ internal class MeshEngine(private val context: Context) {
             if (scanWanted) startScanning()
             resumeAdvertisements()
         } catch (error: Exception) {
-            MeshRuntime.listener?.invoke("onError", mapOf("error" to (error.message ?: "Bluetooth restart failed")))
+            report(error.message ?: "Bluetooth restart failed")
             scheduleRadioRetry()
         }
     }
@@ -339,6 +378,13 @@ internal class MeshEngine(private val context: Context) {
     @Synchronized fun setForeground(value: Boolean) {
         if (foreground == value) return
         foreground = value
+        if (!prefs.getBoolean("relay-enabled", false) && listenInApp) {
+            // No background relay: listen only while Suraksha is on screen.
+            if (value) {
+                try { startScanning() } catch (error: Exception) { report(error.message ?: "Cannot start Bluetooth scan") }
+            } else stopScanning()
+            return
+        }
         handler.removeCallbacks(dutyChange)
         handler.postDelayed(dutyChange, 3000)
     }
@@ -347,7 +393,7 @@ internal class MeshEngine(private val context: Context) {
         try { adapter.bluetoothLeScanner?.stopScan(scanCallback) } catch (_: Exception) {}
         scanning = false
         try { startScanning() }
-        catch (error: Exception) { MeshRuntime.listener?.invoke("onError", mapOf("error" to (error.message ?: "Cannot restart scan"))) }
+        catch (error: Exception) { report(error.message ?: "Cannot restart scan") }
     }
     @Synchronized fun startScanning() {
         scanWanted = true
@@ -439,7 +485,7 @@ internal class MeshEngine(private val context: Context) {
         pending?.reject("BLE_ADV_ERROR", message, null); pending = null
         stopRadio()
         scheduleRadioRetry()
-        MeshRuntime.listener?.invoke("onError", mapOf("error" to message))
+        report(message)
     }
     private val serverCallback = object : BluetoothGattServerCallback() {
         override fun onServiceAdded(status: Int, service: BluetoothGattService) {
@@ -476,6 +522,7 @@ internal class MeshEngine(private val context: Context) {
             server?.sendResponse(device,requestId,BluetoothGatt.GATT_SUCCESS,0,frame)
             if (seq + 1 >= total) {
                 served.getOrPut(device.address) { mutableSetOf() }.add(snapshot.contentHashCode())
+                servedCount++; lastServedAt = now
                 endTransfer(device.address)
             } else cursors[device.address] = seq + 1
         }
@@ -514,13 +561,15 @@ internal class MeshEngine(private val context: Context) {
                 ScanCallback.SCAN_FAILED_SCANNING_TOO_FREQUENTLY -> "Too many Bluetooth scan restarts; retrying shortly"
                 else -> "Bluetooth scanning interrupted (code $code); retrying shortly"
             }
-            MeshRuntime.listener?.invoke("onError", mapOf("error" to reason))
+            report(reason)
             handler.removeCallbacks(scanRetry)
             handler.postDelayed(scanRetry, 6000)
         }
         override fun onScanResult(type: Int, result: ScanResult) {
             val device = result.device
             val now = System.currentTimeMillis()
+            if (seenAt.size > 500) seenAt.clear()
+            seenAt[device.address] = now
             if (connections.size >= 4 || connections.containsKey(device.address) || now - (lastSeen[device.address] ?: 0) < 3000) return
             if (lastSeen.size > 1000) lastSeen.clear()
             lastSeen[device.address] = now
@@ -534,10 +583,12 @@ internal class MeshEngine(private val context: Context) {
         var lastProgress = System.currentTimeMillis()
         var discoveryStarted = false
         var finished = false
+        var complete = false
         val gatt = device.connectGatt(context, false, object : BluetoothGattCallback() {
             @Synchronized fun finish(gatt: BluetoothGatt) {
                 if (finished) return
                 finished = true
+                if (!complete) failedReads++
                 // Random extra cooldown so two phones reading each other drift apart
                 // instead of colliding on every retry.
                 lastSeen[device.address] = System.currentTimeMillis() + (Math.random() * 2000).toLong()
@@ -577,7 +628,7 @@ internal class MeshEngine(private val context: Context) {
                 lastProgress = System.currentTimeMillis()
                 count = total; expected++
                 bytes.write(frame,8,size)
-                if (expected == total) { received(bytes.toByteArray()); finish(gatt) }
+                if (expected == total) { complete = true; received(bytes.toByteArray()); finish(gatt) }
                 else if (!gatt.readCharacteristic(char)) finish(gatt)
             }
         }, BluetoothDevice.TRANSPORT_LE)

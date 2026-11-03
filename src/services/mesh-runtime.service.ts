@@ -26,6 +26,11 @@ let forwarding: Promise<void> | undefined;
 let receiving: Promise<void> | undefined;
 let unsubscribe: (() => void) | undefined;
 let timer: ReturnType<typeof setInterval> | undefined;
+// Why the last nearby message was dropped, for the status card. These used to
+// be dropped silently (e.g. a phone enrolled on a different backend's CA).
+let issue: { reason: string; at: number } | undefined;
+export const inboxIssue = () => issue;
+const noteIssue = (reason: string) => { issue = { reason, at: Date.now() }; };
 
 export async function nearbyEvents(): Promise<ActiveSOSEvent[]> {
   const cancelled = await list<Tombstone>(KEYS.tombstones);
@@ -74,7 +79,7 @@ async function markCancelled(id: string, owner: string, until: number) {
 }
 async function receiveInbox(): Promise<void> {
   const session = await loadSession();
-  if (!session) return;
+  if (!session) { if ((await Peripheral.getInbox()).length) noteIssue('Sign in to check nearby SOS messages.'); return; }
   const deviceId = await SOSTriggerService.getDeviceId();
   const selfLocation = await cachedLocation();
   let failure: unknown;
@@ -90,7 +95,10 @@ async function receivePacket(encoded: string, deviceId: string, session: NonNull
     selfLocation: SOSLocation | undefined): Promise<void> {
   let payload: SOSPayload;
   try { payload = decodePayload(encoded); await verifyOrigin(payload); }
-  catch { await Peripheral.acknowledgeInbox(encoded); return; }
+  catch (error) {
+    noteIssue((error as { message?: string } | undefined)?.message || 'Invalid message');
+    await Peripheral.acknowledgeInbox(encoded); return;
+  }
   if (payload.originDeviceId === deviceId || payload.relayChain.some(p => p.deviceId === deviceId)) {
     await Peripheral.acknowledgeInbox(encoded); return;
   }
@@ -248,6 +256,8 @@ export async function startMeshRuntime(): Promise<void> {
   if (unsubscribe) return;
   const work = () => {
     void renewDeviceIfNeeded().catch(() => undefined);
+    // Signed-in phones listen while the app is open, relay switch or not.
+    void loadSession().then(session => session ? bleMeshInstance.listen() : false).catch(() => undefined);
     void processMeshWork().catch(error => console.warn('SOS work deferred', error instanceof Error ? error.message : 'unknown'));
   };
   bleMeshInstance.on('onInboxReady', work);

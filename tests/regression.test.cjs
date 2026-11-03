@@ -288,6 +288,24 @@ test('one failing inbox packet does not stop later packets or the upload', async
   assert.deepEqual(sent.sort(),['bad','good']);
 });
 
+test('a rejected nearby message records why instead of vanishing silently', async () => {
+  let inbox=['forged'];
+  const runtime=loader({
+    '@react-native-async-storage/async-storage':{getItem:async()=>null,setItem:async()=>{}},
+    'expo-notifications':{},'expo-location':{getLastKnownPositionAsync:async()=>null},'expo-background-task':{},'react-native':{Platform:{OS:'android'}},
+    '../../modules/ble-peripheral':{getInbox:async()=>[...inbox],acknowledgeInbox:async p=>{inbox=inbox.filter(v=>v!==p);}},
+    './ble-codec':{decodePayload:id=>({...payload(id),originDeviceId:'device-a'}),isLivePayload:()=>true},
+    './origin-security':{verifyOrigin:async()=>{throw Error('Untrusted or expired device certificate');}},
+    './session.service':{loadSession:async()=>({user:{user_id:'relay',name:'Relay'}})},
+    './network.service':{NetworkService:{checkConnectivity:async()=>({isOnline:false})}},
+    './sos-api.service':{ApiError:class extends Error {},SOSApiService:{}},
+    './sos-trigger.service':{SOSTriggerService:{getDeviceId:async()=>'device-b',retryPendingQueue:async()=>{},updateActiveLocations:async()=>{}},bleMeshInstance:{startAdvertising:async()=>{}}},
+  })('src/services/mesh-runtime.service.ts');
+  assert.equal(runtime.inboxIssue(),undefined);
+  await runtime.processMeshWork();
+  assert.match(runtime.inboxIssue().reason,/Untrusted/); assert.deepEqual(inbox,[]);
+});
+
 test('an unverifiable server receipt still completes the relay upload and the next one', async () => {
   const store=new Map();const sent=[];
   const relays=['first','second'].map(id=>({...payload(id),hopCount:1}));

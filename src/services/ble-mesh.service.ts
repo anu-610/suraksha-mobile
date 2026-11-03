@@ -111,6 +111,14 @@ export class BLEMeshService {
         throw new Error(modern ? 'Allow Nearby devices permission for Bluetooth SOS.' : 'Nearby relay requires Bluetooth and location permissions.');
     }
   }
+  /** Listen while the app is on screen without the background relay. Never prompts. */
+  public async listen(): Promise<boolean> {
+    if (Platform.OS !== 'android') return false;
+    if (Number(Platform.Version) >= 31 ? !await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN)
+        : !await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION)) return false;
+    await this.initialize();
+    return Peripheral.listenInApp(true);
+  }
   public async startScanning(): Promise<void> {
     if (this.scanning) return;
     await this.initialize();

@@ -21,6 +21,13 @@ export interface DeviceDiscoveredEvent {
   name: string;
 }
 
+/** Live Bluetooth state for the status card. Times are epoch ms, 0 = never. */
+export interface NearbyRadioStatus {
+  bluetoothOn: boolean; advertising: boolean; queued: number; scanning: boolean; backgroundRelay: boolean;
+  nearbyPhones: number; lastSeenAt: number; received: number; lastReceivedAt: number;
+  served: number; lastServedAt: number; failedReads: number; lastError: string; lastErrorAt: number; inbox: number;
+}
+
 export interface BleErrorEvent {
   error: string;
 }
@@ -45,6 +52,8 @@ declare class BlePeripheralNativeModule extends NativeModule<BleEvents> {
   getInbox(): Promise<string[]>;
   acknowledgeInbox(packet: string): Promise<void>;
   isBluetoothEnabled?(): Promise<boolean>;
+  listenInApp?(enabled: boolean): Promise<boolean>;
+  getStatus?(): Promise<NearbyRadioStatus>;
   requestEnableBluetooth?(): Promise<boolean>;
 }
 
@@ -168,6 +177,13 @@ export async function getInbox(): Promise<string[]> { return nativeModule ? nati
 export async function acknowledgeInbox(packet: string): Promise<void> { await nativeModule?.acknowledgeInbox(packet); }
 
 export async function removeAdvertisement(id: string): Promise<void> { await nativeModule?.removeAdvertisement(id); }
+
+export async function listenInApp(enabled: boolean): Promise<boolean> {
+  return nativeModule?.listenInApp ? nativeModule.listenInApp(enabled) : false;
+}
+export async function getStatus(): Promise<NearbyRadioStatus | null> {
+  return nativeModule?.getStatus ? nativeModule.getStatus() : null;
+}
 
 // Android only; other platforms report Bluetooth as available.
 export async function isBluetoothEnabled(): Promise<boolean> {

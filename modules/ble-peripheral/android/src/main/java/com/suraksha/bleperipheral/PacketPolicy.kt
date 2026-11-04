@@ -44,13 +44,27 @@ internal object PacketPolicy {
     // Which packet a reader gets next. `hashes` are queued packets in priority
     // order, `seen` what this reader already read. Unread packets go first, so a
     // new SOS reaches a phone on its next read even while an old cancellation
-    // keeps advertising for its whole TTL. When all are read, a new round starts.
-    fun nextForReader(hashes: List<Int>, seen: MutableSet<Int>): Int {
+    // keeps advertising for its whole TTL. When all are read, a new round starts
+    // only if `newRound` allows it; otherwise the reader is told NOTHING_NEW.
+    const val NOTHING_NEW = -2
+    fun nextForReader(hashes: List<Int>, seen: MutableSet<Int>, newRound: Boolean = true): Int {
         if (hashes.isEmpty()) return -1
         seen.retainAll(hashes.toSet())
         val fresh = hashes.indexOfFirst { it !in seen }
         if (fresh >= 0) return fresh
+        if (!newRound) return NOTHING_NEW
         seen.clear()
         return 0
     }
+
+    // A reader that already has every packet gets a short "nothing new" answer
+    // instead of the whole queue again. It still gets a full repeat now and
+    // then, in case it lost something. A read that follows a finished packet on
+    // the same link (back to back) is a continuation and never starts a round.
+    const val FULL_ROUND_EVERY_MS = 60000L
+    fun mayStartRound(lastRoundAt: Long?, lastFinishedAt: Long?, now: Long): Boolean =
+        !transferIsLive(lastFinishedAt, now) && (lastRoundAt == null || now - lastRoundAt >= FULL_ROUND_EVERY_MS)
+
+    // Packets one reader takes in a single connection before letting others in.
+    const val PACKETS_PER_LINK = 40
 }

@@ -181,6 +181,9 @@ internal class MeshEngine(private val context: Context) {
         val DATA: UUID = UUID.fromString("8fc9a2e1-1b2a-4c3d-9e5f-0a1b2c3d4e5f")
         val FAST_DATA: UUID = UUID.fromString("8fc9a2e3-1b2a-4c3d-9e5f-0a1b2c3d4e5f")
         const val MAX_BYTES = 16384
+        // total = 0: "you already have everything I share". Old readers treat
+        // it as a failed read and simply try again later.
+        val NOTHING_NEW_FRAME = byteArrayOf(83, 75, 2, 0, 0, 0, 0, 0)
     }
     private val adapter get() = (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter ?: throw IllegalStateException("Bluetooth unsupported")
     private val handler = Handler(Looper.getMainLooper())
@@ -312,6 +315,8 @@ internal class MeshEngine(private val context: Context) {
     private val lastSeen = ConcurrentHashMap<String, Long>()
     private val lastReads = ConcurrentHashMap<String, Long>()
     private val served = ConcurrentHashMap<String, MutableSet<Int>>()
+    private val roundAt = ConcurrentHashMap<String, Long>()
+    private val finishedAt = ConcurrentHashMap<String, Long>()
     private var advertExpiry: Runnable? = null
     private val advertTimeout = Runnable { failAdvertising("Advertising timed out") }
     fun checkBluetooth() { check(adapter?.isEnabled == true) { "Enable Bluetooth to use nearby relay" } }
@@ -508,7 +513,12 @@ internal class MeshEngine(private val context: Context) {
             if (!PacketPolicy.transferIsLive(lastReads[device.address], now)) endTransfer(device.address)
             if (snapshots.size >= 8 && !snapshots.containsKey(device.address)) { server?.sendResponse(device,requestId,BluetoothGatt.GATT_FAILURE,0,null); return }
             lastReads[device.address] = now
-            val snapshot = snapshots.getOrPut(device.address) { packetFor(device.address) }
+            val snapshot = snapshots[device.address] ?: packetFor(device.address, now)?.also { snapshots[device.address] = it } ?: run {
+                // Reader already has everything: tell it so in one short frame.
+                server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, NOTHING_NEW_FRAME)
+                endTransfer(device.address)
+                return
+            }
             val seq = cursors[device.address] ?: 0
             val chunkSize = chunkSizes.getOrPut(device.address) {
                 if (characteristic.uuid == FAST_DATA) minOf(180, maxOf(12, (mtus[device.address] ?: 23) - 11)) else 12
@@ -524,16 +534,26 @@ internal class MeshEngine(private val context: Context) {
                 served.getOrPut(device.address) { mutableSetOf() }.add(snapshot.contentHashCode())
                 servedCount++; lastServedAt = now
                 endTransfer(device.address)
+                finishedAt[device.address] = now
             } else cursors[device.address] = seq + 1
         }
     }
     // Per reader, not one 10 s slot for everyone: the old shared rotation gave a
     // new SOS 1 slot in 4 (1 in 6 with two cancellations) after a cancel.
-    @Synchronized private fun packetFor(reader: String): ByteArray {
-        val all = packets.values.sortedBy { priority(it) }
+    // Newest first within a priority, so a fresh SOS beats old test traffic.
+    // Null means this reader already has every packet (see mayStartRound).
+    @Synchronized private fun packetFor(reader: String, now: Long): ByteArray? {
+        val all = packets.values.sortedWith(compareBy<ByteArray> { priority(it) }.thenByDescending { version(it).timestamp })
         if (all.isEmpty()) return payload.copyOf()
-        if (served.size > 200) served.clear()
-        val index = PacketPolicy.nextForReader(all.map { it.contentHashCode() }, served.getOrPut(reader) { mutableSetOf() })
+        if (served.size > 200) { served.clear(); roundAt.clear(); finishedAt.clear() }
+        val seen = served.getOrPut(reader) { roundAt[reader] = now; mutableSetOf() }
+        val hashes = all.map { it.contentHashCode() }
+        var index = PacketPolicy.nextForReader(hashes, seen, newRound = false)
+        if (index == PacketPolicy.NOTHING_NEW) {
+            if (!PacketPolicy.mayStartRound(roundAt[reader], finishedAt[reader], now)) return null
+            roundAt[reader] = now
+            index = PacketPolicy.nextForReader(hashes, seen)
+        }
         return all[index].copyOf()
     }
     private fun endTransfer(address: String) {
@@ -584,11 +604,15 @@ internal class MeshEngine(private val context: Context) {
         var discoveryStarted = false
         var finished = false
         var complete = false
+        // One connection reads packet after packet until the peer says it has
+        // nothing new. Before, each packet cost a whole connect/cooldown cycle
+        // (5-8 s), so a new SOS behind 18 queued packets took minutes.
+        val got = mutableSetOf<Int>()
         val gatt = device.connectGatt(context, false, object : BluetoothGattCallback() {
             @Synchronized fun finish(gatt: BluetoothGatt) {
                 if (finished) return
                 finished = true
-                if (!complete) failedReads++
+                if (!complete && got.isEmpty()) failedReads++
                 // Random extra cooldown so two phones reading each other drift apart
                 // instead of colliding on every retry.
                 lastSeen[device.address] = System.currentTimeMillis() + (Math.random() * 2000).toLong()
@@ -620,6 +644,9 @@ internal class MeshEngine(private val context: Context) {
                 consume(gatt, characteristic, value, status)
             }
             fun consume(gatt: BluetoothGatt, char: BluetoothGattCharacteristic, frame: ByteArray, status: Int) {
+                if (status == BluetoothGatt.GATT_SUCCESS && expected == 0 && frame.contentEquals(NOTHING_NEW_FRAME)) {
+                    complete = true; finish(gatt); return
+                }
                 if (status != BluetoothGatt.GATT_SUCCESS || frame.size < 8 || frame[0].toInt()!=83 || frame[1].toInt()!=75 || frame[2].toInt()!=2) { finish(gatt); return }
                 val seq = ((frame[3].toInt() and 255) shl 8) or (frame[4].toInt() and 255)
                 val total = ((frame[5].toInt() and 255) shl 8) or (frame[6].toInt() and 255)
@@ -628,7 +655,14 @@ internal class MeshEngine(private val context: Context) {
                 lastProgress = System.currentTimeMillis()
                 count = total; expected++
                 bytes.write(frame,8,size)
-                if (expected == total) { complete = true; received(bytes.toByteArray()); finish(gatt) }
+                if (expected == total) {
+                    val packet = bytes.toByteArray()
+                    // A repeat means the peer is cycling (older app version): stop.
+                    if (!got.add(packet.contentHashCode())) { finish(gatt); return }
+                    received(packet)
+                    bytes.reset(); expected = 0; count = -1
+                    if (got.size >= PacketPolicy.PACKETS_PER_LINK || !gatt.readCharacteristic(char)) finish(gatt)
+                }
                 else if (!gatt.readCharacteristic(char)) finish(gatt)
             }
         }, BluetoothDevice.TRANSPORT_LE)

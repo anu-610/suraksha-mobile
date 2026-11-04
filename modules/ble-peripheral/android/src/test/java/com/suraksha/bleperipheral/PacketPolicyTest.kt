@@ -51,6 +51,19 @@ class PacketPolicyTest {
         assertEquals(1, PacketPolicy.nextForReader(listOf(cancel, second), seen))
         assertEquals(-1, PacketPolicy.nextForReader(emptyList(), mutableSetOf()))
     }
+    @Test fun readerWithEverythingGetsNothingNewUntilFullRoundIsDue() {
+        val seen = mutableSetOf(11, 22)
+        assertEquals(PacketPolicy.NOTHING_NEW, PacketPolicy.nextForReader(listOf(11, 22), seen, newRound = false))
+        assertEquals(setOf(11, 22), seen) // nothing forgotten
+        // A new SOS is still served at once, even without a new round.
+        assertEquals(2, PacketPolicy.nextForReader(listOf(11, 22, 33), seen, newRound = false))
+        // Back-to-back read on the same link never restarts the round.
+        assertFalse(PacketPolicy.mayStartRound(0L, 99000L, 100000L))
+        // New connection: repeat everything at most once a minute.
+        assertFalse(PacketPolicy.mayStartRound(50000L, 10000L, 100000L))
+        assertTrue(PacketPolicy.mayStartRound(30000L, 10000L, 100000L))
+        assertTrue(PacketPolicy.mayStartRound(null, null, 100000L))
+    }
     @Test fun reconnectAfterGapRestartsServerTransfer() {
         assertFalse(PacketPolicy.transferIsLive(null, 5000L))
         assertTrue(PacketPolicy.transferIsLive(4900L, 5000L))

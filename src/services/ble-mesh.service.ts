@@ -2,7 +2,7 @@ import { PermissionsAndroid, Platform } from 'react-native';
 import * as Peripheral from '../../modules/ble-peripheral';
 import { SOSPayload, SOSLocation, DeliveryMethod } from '../interfaces/sos.types';
 import { encodePayload, isLivePayload } from './ble-codec';
-import { canReplace } from './mesh-policy';
+import { canReplace, onAirUntil } from './mesh-policy';
 
 
 type Events = { onInboxReady: undefined; onSOSReceived: SOSPayload; onError: Error; onRelayComplete: SOSPayload };
@@ -42,7 +42,8 @@ export class BLEMeshService {
   }
 
   public async startAdvertising(payload: SOSPayload): Promise<void> {
-    if (payload.uploadOnly) return;
+    // Old cancels/receipts stay queued for upload but are no longer advertised.
+    if (payload.uploadOnly || onAirUntil(payload) <= Date.now()) return;
     const suppressed = () => (this.retired.get(payload.sosId) ?? 0) > Date.now() && payload.messageType !== 'SOS_CANCEL' ||
       payload.messageType === 'SOS_HELPER' && (this.retired.get(payload.targetSosId ?? '') ?? 0) > Date.now();
     if (suppressed()) return;
@@ -66,7 +67,8 @@ export class BLEMeshService {
     for (const [id, until] of this.retired) if (until <= Date.now()) this.retired.delete(id);
     this.retired.set(sosId, Date.now() + 3900000);
     if (!replacingWithCancellation) await Peripheral.removeAdvertisement(sosId);
-    for (const p of this.latest.values()) if (p.messageType === 'SOS_HELPER' && p.targetSosId === sosId) await Peripheral.removeAdvertisement(p.sosId);
+    for (const p of this.latest.values()) if ((p.messageType === 'SOS_HELPER' || p.messageType === 'SOS_ACK' && p.receiptMessageType === 'SOS_ALERT') &&
+        p.targetSosId === sosId) await Peripheral.removeAdvertisement(p.sosId);
   }
   public reportReceived(payload: SOSPayload) { this.emit('onSOSReceived', payload); }
   public async isBluetoothOn(): Promise<boolean> {

@@ -69,4 +69,33 @@ class PacketPolicyTest {
         assertTrue(PacketPolicy.transferIsLive(4900L, 5000L))
         assertFalse(PacketPolicy.transferIsLive(1000L, 5000L))
     }
+    // Round 5: old SOS/cancel rounds must not hold back or block a new SOS.
+    private fun ack(id: String, from: String, rev: Long, type: String = "SOS_ALERT", at: Long = 1000L, target: String = "x") =
+        PacketMeta(id, "SOS_ACK", at, target = target, origin = from, receiptKind = "peer", receiptType = type, receiptRevision = rev)
+    @Test fun cancelsAndReceiptsLeaveTheAirAfterFifteenMinutes() {
+        assertEquals(1000L + PacketPolicy.DONE_ON_AIR_MS, PacketPolicy.onAirUntil("SOS_CANCEL", 1000L, 3601000L))
+        assertEquals(1000L + PacketPolicy.DONE_ON_AIR_MS, PacketPolicy.onAirUntil("SOS_ACK", 1000L, 3601000L))
+        assertEquals(3601000L, PacketPolicy.onAirUntil("SOS_ALERT", 1000L, 3601000L))
+    }
+    @Test fun newSosIsServedBeforeOldCancelsAndReceipts() {
+        val queue = listOf(PacketMeta("old", "SOS_CANCEL", 1000L), ack("r", "b", 0, at = 9000L), PacketMeta("new", "SOS_ALERT", 5000L))
+        assertEquals(listOf("new", "old", "r"), queue.sortedWith(PacketPolicy.serveOrder).map { it.id })
+    }
+    @Test fun onlyNewestReceiptPerSenderIsKeptAndCancelClearsAlertReceipts() {
+        val rev0 = ack("r0", "b", 0); val rev1 = ack("r1", "b", 1); val fromC = ack("c0", "c", 0)
+        assertEquals(listOf("r0"), PacketPolicy.staleAfter(rev1, listOf(rev0, fromC)))
+        assertTrue(PacketPolicy.isStale(rev0, listOf(rev1)))
+        assertFalse(PacketPolicy.isStale(fromC, listOf(rev1)))
+        val cancel = PacketMeta("x", "SOS_CANCEL", 2000L)
+        val cancelAck = ack("rc", "b", 2, "SOS_CANCEL")
+        assertEquals(listOf("r1", "c0"), PacketPolicy.staleAfter(cancel, listOf(rev1, fromC, cancelAck)))
+        assertTrue(PacketPolicy.isStale(ack("late", "d", 0), listOf(cancel)))
+        assertFalse(PacketPolicy.isStale(cancelAck, listOf(cancel)))
+    }
+    @Test fun fullQueueDropsReceiptsThenRelayedCopiesNeverOwnSos() {
+        val own = PacketMeta("own", "SOS_ALERT", 100L); val relayed = PacketMeta("relayed", "SOS_ALERT", 500L, hops = 1)
+        assertEquals("r", PacketPolicy.evictionCandidate(listOf(own, relayed, ack("r", "b", 0, at = 9000L))))
+        assertEquals("relayed", PacketPolicy.evictionCandidate(listOf(own, relayed)))
+        assertNull(PacketPolicy.evictionCandidate(listOf(own, PacketMeta("ownCancel", "SOS_CANCEL", 50L))))
+    }
 }

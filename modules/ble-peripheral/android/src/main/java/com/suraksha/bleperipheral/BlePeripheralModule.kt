@@ -245,6 +245,22 @@ internal class MeshEngine(private val context: Context) {
         val p = objectData(bytes)
         return PacketPolicy.priority(p.getString("messageType"), p.optString("helperState", ""), p.optBoolean("helperRequested", false))
     }
+    // Parsed once per stored packet (arrays hash by identity), not on every read.
+    private val metas = java.util.WeakHashMap<ByteArray, PacketMeta>()
+    private fun meta(bytes: ByteArray): PacketMeta = metas.getOrPut(bytes) {
+        val p = objectData(bytes)
+        PacketMeta(p.getString("sosId"), p.getString("messageType"), java.time.Instant.parse(p.getString("timestamp")).toEpochMilli(),
+            p.optInt("hopCount", 0), p.optString("targetSosId", ""), p.optString("originDeviceId", ""),
+            p.optString("receiptKind", ""), p.optString("receiptMessageType", ""), p.optLong("receiptRevision", 0))
+    }
+    private fun onAirUntil(bytes: ByteArray): Long = meta(bytes).let { PacketPolicy.onAirUntil(it.type, it.timestamp, expires(bytes)) }
+    /** Drops packets that are off air or made useless by newer ones. */
+    private fun prune(now: Long = System.currentTimeMillis()) {
+        packets.entries.removeAll { onAirUntil(it.value) <= now }
+        val all = packets.values.map { meta(it) }
+        val stale = all.filter { PacketPolicy.isStale(it, all) }.map { it.id }.toSet()
+        packets.keys.removeAll(stale)
+    }
     private fun nextPacket(): ByteArray {
         val all = packets.values.toList()
         // Every other slot favors controls; round robin slots keep alerts moving.
@@ -256,8 +272,7 @@ internal class MeshEngine(private val context: Context) {
     private val rotate = object : Runnable {
         override fun run() {
             synchronized(this@MeshEngine) {
-                val now = System.currentTimeMillis()
-                packets.entries.removeAll { expires(it.value) <= now }
+                prune()
                 try { persistPackets() } catch (error: Exception) {
                     report(error.message ?: "Cannot persist BLE queue")
                 }
@@ -292,11 +307,11 @@ internal class MeshEngine(private val context: Context) {
             } catch (_: Exception) {}
         }
     }
-    init { restorePackets() }
+    init { restorePackets(); prune() }
     @Synchronized fun resumeAdvertisements() {
         if (advertising || starting) return
         checkBluetooth()
-        packets.entries.removeAll { expires(it.value) <= System.currentTimeMillis() }
+        prune()
         if (packets.isNotEmpty()) {
             payload = packets.values.minByOrNull { priority(it) }!!
             try { beginAdvertising() } catch (error: Exception) { stopRadio(); throw error }
@@ -324,11 +339,22 @@ internal class MeshEngine(private val context: Context) {
         val array = JSONArray(prefs.getString("inbox", "[]"))
         return (0 until array.length()).map { array.getString(it) }
     }
-    @Synchronized fun acknowledge(packet: String) { prefs.edit().putString("inbox", JSONArray(inbox().filter { it != packet }).toString()).commit() }
+    // Packets the app already processed. Peers repeat their whole queue now and
+    // then; handing every repeat to JS again (signature check, storage writes)
+    // slowed everything down as old test traffic grew.
+    private val handled = ConcurrentHashMap<String, Long>()
+    @Synchronized fun acknowledge(packet: String) {
+        val now = System.currentTimeMillis()
+        if (handled.size > 500) handled.entries.removeAll { now - it.value > PacketPolicy.HANDLED_FOR_MS }
+        handled[packet] = now
+        prefs.edit().putString("inbox", JSONArray(inbox().filter { it != packet }).toString()).commit()
+    }
     @Synchronized private fun received(bytes: ByteArray) {
         val packet = Base64.encodeToString(bytes, Base64.NO_WRAP)
+        val now = System.currentTimeMillis()
+        receivedCount++; lastReceivedAt = now
+        if (handled[packet]?.let { now - it < PacketPolicy.HANDLED_FOR_MS } == true) return
         val existing = inbox()
-        receivedCount++; lastReceivedAt = System.currentTimeMillis()
         if (!existing.contains(packet)) {
             // Bound attacker-controlled storage. Never evict already accepted inbox items.
             if (existing.size >= 100) return
@@ -433,25 +459,41 @@ internal class MeshEngine(private val context: Context) {
             val id = data.getString("sosId")
             check(expires(bytes) > System.currentTimeMillis()) { "SOS expired" }
             synchronized(this) {
-                val previous = versions[id] ?: packets[id]
-                if (!PacketPolicy.canReplace(previous?.let { version(it) }, version(bytes))) { promise.resolve(true); return }
-                check(PacketPolicy.hasCapacity(packets.size, packets.containsKey(id), priority(bytes))) { "Relay advertising queue is full" }
-                // Routine durable retries must not reset round-robin rotation.
-                // Only a genuinely urgent packet or the current packet's update preempts.
-                if (PacketPolicy.shouldPreempt(if (payload.isEmpty()) null else objectData(payload).getString("sosId"),
-                        id, if (payload.isEmpty()) Int.MAX_VALUE else priority(payload), priority(bytes),
-                        packets[id]?.contentEquals(bytes) != true)) payload = bytes
-                packets[id] = bytes
-                versions[id] = bytes
-                // A verified cancellation/request change also retires old consent snapshots.
-                if (data.getString("messageType") in listOf("SOS_CANCEL", "SOS_ALERT")) {
-                    packets.entries.removeAll { (_, stored) ->
-                        val p = objectData(stored)
-                        p.optString("targetSosId") == id && p.optString("messageType") == "SOS_HELPER" &&
-                            (data.getString("messageType") == "SOS_CANCEL" || !data.optBoolean("helperRequested") || p.optString("helperRequestId") != data.optString("helperRequestId"))
+                // The app re-sends every queued packet each 10 s. An unchanged one
+                // needs no disk write (that used to be one per packet per tick).
+                val unchanged = packets[id]?.contentEquals(bytes) == true
+                if (!unchanged) {
+                    // An old cancel/receipt, or a receipt already replaced by a newer
+                    // one, is done: accept quietly but keep it off air.
+                    prune()
+                    val added = meta(bytes)
+                    if (onAirUntil(bytes) <= System.currentTimeMillis() || PacketPolicy.isStale(added, packets.values.map { meta(it) })) { promise.resolve(true); return }
+                    val previous = versions[id] ?: packets[id]
+                    if (!PacketPolicy.canReplace(previous?.let { version(it) }, version(bytes))) { promise.resolve(true); return }
+                    // Full queue: drop old receipts / relayed copies instead of refusing a new SOS.
+                    while (!PacketPolicy.hasCapacity(packets.size, packets.containsKey(id), priority(bytes))) {
+                        packets.remove(PacketPolicy.evictionCandidate(packets.values.map { meta(it) }) ?: break)
                     }
+                    check(PacketPolicy.hasCapacity(packets.size, packets.containsKey(id), priority(bytes))) { "Relay advertising queue is full" }
+                    // Routine durable retries must not reset round-robin rotation.
+                    // Only a genuinely urgent packet or the current packet's update preempts.
+                    if (PacketPolicy.shouldPreempt(if (payload.isEmpty()) null else objectData(payload).getString("sosId"),
+                            id, if (payload.isEmpty()) Int.MAX_VALUE else priority(payload), priority(bytes),
+                            true)) payload = bytes
+                    packets[id] = bytes
+                    versions[id] = bytes
+                    // Older receipts of the same SOS, and alert receipts once it is cancelled.
+                    packets.keys.removeAll(PacketPolicy.staleAfter(added, packets.values.map { meta(it) }).toSet())
+                    // A verified cancellation/request change also retires old consent snapshots.
+                    if (data.getString("messageType") in listOf("SOS_CANCEL", "SOS_ALERT")) {
+                        packets.entries.removeAll { (_, stored) ->
+                            val p = objectData(stored)
+                            p.optString("targetSosId") == id && p.optString("messageType") == "SOS_HELPER" &&
+                                (data.getString("messageType") == "SOS_CANCEL" || !data.optBoolean("helperRequested") || p.optString("helperRequestId") != data.optString("helperRequestId"))
+                        }
+                    }
+                    persistPackets()
                 }
-                persistPackets()
             }
             checkBluetooth()
             if (advertising || starting) { promise.resolve(true); return }
@@ -540,10 +582,11 @@ internal class MeshEngine(private val context: Context) {
     }
     // Per reader, not one 10 s slot for everyone: the old shared rotation gave a
     // new SOS 1 slot in 4 (1 in 6 with two cancellations) after a cancel.
-    // Newest first within a priority, so a fresh SOS beats old test traffic.
+    // Newest first and receipts last, so a fresh SOS beats old test traffic.
     // Null means this reader already has every packet (see mayStartRound).
     @Synchronized private fun packetFor(reader: String, now: Long): ByteArray? {
-        val all = packets.values.sortedWith(compareBy<ByteArray> { priority(it) }.thenByDescending { version(it).timestamp })
+        prune(now)
+        val all = packets.values.sortedWith(compareBy<ByteArray, PacketMeta>(PacketPolicy.serveOrder) { meta(it) })
         if (all.isEmpty()) return payload.copyOf()
         if (served.size > 200) { served.clear(); roundAt.clear(); finishedAt.clear() }
         val seen = served.getOrPut(reader) { roundAt[reader] = now; mutableSetOf() }

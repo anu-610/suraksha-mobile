@@ -925,3 +925,39 @@ test('background GPS fix arriving during a pending lookup is retained after it f
   await Promise.all([lookup,callback]);
   assert.equal((await h.service.activeSOS())[0].location.latitude,18);
 });
+
+// Round 5: many SOS + cancel rounds used to pile up receipts and cancels for 1 h,
+// so a new SOS waited behind them or found the queue full.
+function receipt(target, kind, from, rev, type = 'SOS_ALERT', at = Date.now()) {
+  const timestamp = new Date(at).toISOString();
+  return { ...payload('r-' + Math.random()), protocolVersion: 3, revision: 0, messageType: 'SOS_ACK', location: null, timestamp, createdAt: timestamp,
+    userId: from, originDeviceId: from, targetSosId: target, targetDeviceId: 'device', receiptKind: kind, receiptRevision: rev,
+    receiptMessageType: type, receiptStatus: kind === 'server' ? (type === 'SOS_CANCEL' ? 'cancelled' : 'accepted') : 'received',
+    serverReceipt: kind === 'server' ? 'token' : undefined };
+}
+test('old cancels and receipts leave the air after 15 min, alerts keep their TTL', () => {
+  const policy = loader()('src/services/mesh-policy.ts');
+  const old = Date.now() - 16 * 60000;
+  assert.ok(policy.onAirUntil({ ...payload(), messageType: 'SOS_CANCEL', timestamp: new Date(old).toISOString() }) < Date.now());
+  assert.ok(policy.onAirUntil(receipt('x', 'peer', 'b', 0, 'SOS_ALERT', old)) < Date.now());
+  assert.ok(policy.onAirUntil({ ...payload(), timestamp: new Date(old).toISOString() }) > Date.now());
+});
+test('only the newest receipt per SOS and sender is kept, and a cancel clears alert receipts', async () => {
+  const store = new Map();
+  const load = loader({ '@react-native-async-storage/async-storage': { getItem: async k => store.get(k) ?? null, setItem: async (k, v) => { store.set(k, v); } } });
+  const mesh = load('src/services/mesh-store.ts');
+  const relays = () => JSON.parse(store.get(mesh.KEYS.relays));
+  const rev0 = receipt('x', 'peer', 'b', 0), rev1 = receipt('x', 'peer', 'b', 1), server = receipt('x', 'server', 'suraksha-server', 1);
+  const other = receipt('x', 'peer', 'c', 0);
+  for (const p of [rev0, rev1, server, other]) assert.equal(await mesh.enqueue(p), true);
+  assert.deepEqual(relays().map(p => p.sosId).sort(), [rev1, server, other].map(p => p.sosId).sort());
+  // A late receipt for an older location update is dropped.
+  assert.equal(await mesh.enqueue(receipt('x', 'peer', 'b', 0)), false);
+  // Cancel of x: its alert receipts go; a receipt for the cancel itself stays.
+  const cancel = { ...payload('x'), protocolVersion: 3, revision: 2, messageType: 'SOS_CANCEL', location: null, hopCount: 1 };
+  assert.equal(await mesh.enqueue(cancel), true);
+  assert.deepEqual(relays().map(p => p.sosId), ['x']);
+  assert.equal(await mesh.enqueue(receipt('x', 'peer', 'b', 1)), false);
+  assert.equal(await mesh.enqueue(receipt('x', 'server', 'suraksha-server', 2, 'SOS_CANCEL')), true);
+  assert.equal(relays().length, 2);
+});

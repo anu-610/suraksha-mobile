@@ -13,7 +13,7 @@ import { loadSession } from './session.service';
 import { NetworkService } from './network.service';
 import { ActiveSOSEvent, SOSPayload, SOSLocation, SOSMessageType } from '../interfaces/sos.types';
 import { KEYS, serial, list, enqueue, Tombstone } from './mesh-store';
-import { canReplace, expiresAt, packetKey, packetPriority, requestId, requestIsOpen } from './mesh-policy';
+import { canReplace, expiresAt, onAirUntil, packetKey, packetPriority, requestId, requestIsOpen } from './mesh-policy';
 import { queuePeerReceipt, queueServerReceipt } from './mesh-receipts';
 import { mayUpload, uploadFailed, uploadSucceeded } from './retry-policy';
 import type { HelperChoice } from './helper-consent.service';
@@ -72,7 +72,9 @@ async function markCancelled(id: string, owner: string, until: number) {
   await AsyncStorage.setItem(KEYS.tombstones, JSON.stringify([...tombstones, { id, owner, until }]));
   await AsyncStorage.setItem(KEYS.nearby, JSON.stringify((await list<SOSPayload>(KEYS.nearby)).filter(p => !(p.sosId === id && p.userId === owner))));
   await AsyncStorage.setItem(KEYS.relays, JSON.stringify((await list<SOSPayload>(KEYS.relays)).filter(p =>
-    !(p.sosId === id && p.userId === owner && p.messageType === SOSMessageType.SOS_ALERT) && !(p.targetSosId === id && p.messageType === SOSMessageType.SOS_HELPER))));
+    !(p.sosId === id && p.userId === owner && p.messageType === SOSMessageType.SOS_ALERT) && !(p.targetSosId === id && p.messageType === SOSMessageType.SOS_HELPER) &&
+    // Receipts for a cancelled alert are no use to anyone any more.
+    !(p.targetSosId === id && p.messageType === SOSMessageType.SOS_ACK && p.receiptMessageType === SOSMessageType.SOS_ALERT))));
   await AsyncStorage.setItem(KEYS.offers, JSON.stringify((await list<SOSPayload>(KEYS.offers)).filter(p => p.targetSosId !== id)));
   const outgoing = await list<HelperChoice>(KEYS.outgoing);
   await AsyncStorage.setItem(KEYS.outgoing, JSON.stringify(outgoing.map(p => p.sosId === id ? { ...p, state: 'withdrawn', operation: 'cancelled', packet: undefined } : p)));
@@ -157,7 +159,9 @@ async function receivePacket(encoded: string, deviceId: string, session: NonNull
     }
     accepted = true;
     // Hop limits stop further radio forwarding, not the final internet upload.
-    if (payload.hopCount < payload.maxHops || [SOSMessageType.SOS_ALERT, SOSMessageType.SOS_CANCEL].includes(payload.messageType)) {
+    // A receipt meant for this phone has arrived; relaying it on only adds traffic.
+    if ((payload.hopCount < payload.maxHops || [SOSMessageType.SOS_ALERT, SOSMessageType.SOS_CANCEL].includes(payload.messageType)) &&
+        !(payload.messageType === SOSMessageType.SOS_ACK && payload.targetDeviceId === deviceId)) {
       const candidate = bleMeshInstance.prepareRelay(payload, deviceId);
       if (await enqueue(candidate)) packet = candidate;
     }
@@ -190,7 +194,10 @@ export async function processMeshWork(): Promise<void> {
 async function forwardPending(): Promise<void> {
   const pending = await serial(async () => {
     const cancelled = (await list<Tombstone>(KEYS.tombstones)).filter(p => p.until > Date.now());
+    // Receipts are never uploaded, so they leave once off air. Cancels stay until
+    // their TTL for the upload, but are not advertised past their on-air time.
     const live = (await list<SOSPayload>(KEYS.relays)).filter(p => isLivePayload(p) &&
+      (p.messageType !== SOSMessageType.SOS_ACK || onAirUntil(p) > Date.now()) &&
       (p.messageType !== SOSMessageType.SOS_ALERT || !cancelled.some(c => c.id === p.sosId && c.owner === p.userId)) &&
       (p.messageType !== SOSMessageType.SOS_HELPER || !cancelled.some(c => c.id === p.targetSosId)));
     await AsyncStorage.setItem(KEYS.relays, JSON.stringify(live));

@@ -72,3 +72,17 @@ Problem: a phone could receive an SOS over BLE, but the relayed copy often never
 | A new SOS took minutes to reach a nearby phone | Each connection carried one packet and cost a connect/cooldown cycle (5-8 s). With 18-30 queued packets (old test SOS, cancels, receipts, relayed copies) the new one waited its turn; a rotated Bluetooth address restarted the whole round | One connection reads packet after packet; a sender whose reader already has everything answers with a short "nothing new" frame (full repeat at most once a minute). Newest first within a priority. Old-version peers: the reader stops on a repeated packet |
 
 Validation: 58 mobile tests pass (7 new), typecheck and lint pass, 9 `PacketPolicy` JVM tests pass. The full native module was not compiled locally (no Android SDK); the CI `android-native` job does that. Physical phone-to-phone BLE has NOT been tested; follow RELAY_TESTING.md.
+
+## Old SOS/cancel traffic clean-up — 6 November 2026
+
+Problem: after many SOS + cancel rounds, nearby SOS got slow and then stopped.
+
+| Finding | Root cause | Change |
+|---|---|---|
+| New SOS refused after many test rounds | Every round left a cancel plus one receipt per location update per phone (and the server's), all on air for the full 1 h TTL. At 100 queued packets the native queue refused a new SOS ("Relay advertising queue is full") | Cancels and receipts stay on air 15 min (`DONE_ON_AIR_MS`), not 1 h. A full queue drops old receipts, then old relayed copies, never this phone's own SOS or cancel |
+| New SOS waited behind old traffic | Readers got cancels and receipts first (priority order), so a new alert came after dozens of old packets | Readers get packets newest first, receipts last |
+| Receipts multiplied | Each location update made a new receipt; old ones were kept; the target phone relayed receipts meant for itself | Only the newest receipt per (SOS, kind, sender) is kept; a cancel removes the alert receipts of that SOS; a phone does not relay a receipt addressed to itself |
+| Phone got slower over time | The app re-sends every queued packet each 10 s and each one caused a full disk write of the queue; peers' full repeats went through JS signature checks and storage writes again | Unchanged packets skip the write; a packet the app already handled is not put in the inbox again for 5 min (`HANDLED_FOR_MS`) |
+
+Same rules in JS (`mesh-policy.ts`, `mesh-store.ts`) and native (`PacketPolicy.kt`). Cancels stay in the upload queue until their TTL; only their radio time is shorter.
+Validation: 60 mobile tests (2 new), typecheck and lint pass; 13 `PacketPolicy` JVM tests (4 new). Native module compiles only in CI. Not phone-tested yet.

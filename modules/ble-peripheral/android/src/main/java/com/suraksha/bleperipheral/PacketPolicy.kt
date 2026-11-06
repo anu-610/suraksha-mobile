@@ -4,7 +4,49 @@ package com.suraksha.bleperipheral
 internal data class PacketVersion(val owner: String, val type: String, val revision: Long,
     val timestamp: Long, val helperState: String = "", val hops: Int = 0)
 
+/** What the queue cleanup needs from one packet, parsed once. */
+internal data class PacketMeta(val id: String, val type: String, val timestamp: Long, val hops: Int = 0,
+    val target: String = "", val origin: String = "", val receiptKind: String = "",
+    val receiptType: String = "", val receiptRevision: Long = 0)
+
 internal object PacketPolicy {
+    // Cancels and receipts only confirm something that already happened. They
+    // used to stay on air for the whole 1 h TTL, so every test SOS + cancel left
+    // a pile behind (one receipt per location update per phone) that a new SOS
+    // had to wait behind, or that filled the queue so the new SOS was refused.
+    const val DONE_ON_AIR_MS = 15 * 60000L
+    fun onAirUntil(type: String, timestamp: Long, ttlExpiry: Long): Long =
+        if (type == "SOS_CANCEL" || type == "SOS_ACK") minOf(ttlExpiry, timestamp + DONE_ON_AIR_MS) else ttlExpiry
+
+    // Order a reader gets packets in: newest first, receipts after everything else.
+    val serveOrder: Comparator<PacketMeta> =
+        compareBy<PacketMeta> { if (it.type == "SOS_ACK") 1 else 0 }.thenByDescending { it.timestamp }
+
+    // One receipt per (SOS, kind, sender) is enough: the newest one.
+    private fun sameReceiptSlot(a: PacketMeta, b: PacketMeta) = a.type == "SOS_ACK" && b.type == "SOS_ACK" &&
+        a.target == b.target && a.receiptKind == b.receiptKind && a.origin == b.origin
+    private fun receiptCompare(a: PacketMeta, b: PacketMeta): Int =
+        compareValuesBy(a, b, { if (it.receiptType == "SOS_CANCEL") 1 else 0 }, { it.receiptRevision }, { it.timestamp })
+
+    /** Queued packets that `added` makes useless: older receipts of the same slot, alert receipts of a cancelled SOS. */
+    fun staleAfter(added: PacketMeta, queued: Collection<PacketMeta>): List<String> = queued.filter { it.id != added.id && (
+        sameReceiptSlot(added, it) && receiptCompare(added, it) >= 0 ||
+        added.type == "SOS_CANCEL" && it.type == "SOS_ACK" && it.target == added.id && it.receiptType == "SOS_ALERT") }.map { it.id }
+
+    /** `added` is already useless: a newer receipt of its slot, or the cancel of its SOS, is queued. */
+    fun isStale(added: PacketMeta, queued: Collection<PacketMeta>): Boolean = added.type == "SOS_ACK" && queued.any { it.id != added.id && (
+        sameReceiptSlot(added, it) && receiptCompare(it, added) > 0 ||
+        added.receiptType == "SOS_ALERT" && it.type == "SOS_CANCEL" && it.id == added.target) }
+
+    /** Packet to drop when the queue is full: receipts first, then relayed copies, oldest first. Never our own SOS or cancel. */
+    fun evictionCandidate(queued: Collection<PacketMeta>): String? =
+        queued.filter { it.type == "SOS_ACK" }.minByOrNull { it.timestamp }?.id
+            ?: queued.filter { it.hops > 0 }.minByOrNull { it.timestamp }?.id
+
+    // Inbox repeats: a peer resends its whole queue now and then. A packet the app
+    // already handled is not handed to it again for this long.
+    const val HANDLED_FOR_MS = 5 * 60000L
+
     fun canReplace(old: PacketVersion?, next: PacketVersion): Boolean {
         if (old == null) return true
         if (old.owner != next.owner) return false

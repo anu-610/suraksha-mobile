@@ -1,7 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SOSPayload } from '../interfaces/sos.types';
 import { isLivePayload } from './ble-codec';
-import { canReplace } from './mesh-policy';
+import { canReplace, isStale, staleAfter } from './mesh-policy';
 
 export const KEYS = { tombstones: '@suraksha.mesh.cancelled.v2', offers: '@suraksha.helper.offers.v2',
   relays: '@suraksha.relay.pending.v2', nearby: '@suraksha.nearby.v2', forwarded: '@suraksha.relay.forwarded.v1',
@@ -19,12 +19,14 @@ export async function list<T>(key: string): Promise<T[]> {
 export async function enqueue(packet: SOSPayload): Promise<boolean> {
   const pending = (await list<SOSPayload>(KEYS.relays)).filter(isLivePayload);
   const current = pending.find(p => p.sosId === packet.sosId);
-  if (!canReplace(current, packet)) return false;
+  if (!canReplace(current, packet) || isStale(packet, pending)) return false;
   // Repeated scans need no write or immediate advertisement; the durable retry
   // loop already restores accepted packets after a transient radio failure.
   if (current && current.messageType === packet.messageType && current.revision === packet.revision &&
       current.timestamp === packet.timestamp && current.hopCount === packet.hopCount) return false;
-  await AsyncStorage.setItem(KEYS.relays, JSON.stringify([...pending.filter(p => p.sosId !== packet.sosId), packet]));
+  // Older receipts of the same SOS, and alert receipts once it is cancelled, go.
+  const stale = new Set(staleAfter(packet, pending).map(p => p.sosId));
+  await AsyncStorage.setItem(KEYS.relays, JSON.stringify([...pending.filter(p => p.sosId !== packet.sosId && !stale.has(p.sosId)), packet]));
   return true;
 }
 export type Tombstone = { id: string; owner: string; until: number };
